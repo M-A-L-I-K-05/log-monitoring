@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <title>Factory Simulator</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <header>
+        <div class="header-left">
+            <h1>Factory Simulator</h1>
+            <div class="status-line">
+                <span class="virtual-time" id="virtual-time">—</span>
+                <span class="speed-badge" id="speed-badge">×1</span>
+                <span class="running-badge" id="running-badge">stopped</span>
+            </div>
+        </div>
+        <div class="controls">
+            <button id="btn-start" class="btn btn-green">Start</button>
+            <button id="btn-stop" class="btn btn-red">Stop</button>
+            <button id="btn-restart" class="btn btn-blue">Restart</button>
+            <span class="separator">|</span>
+            <button class="btn btn-speed" data-speed="1">×1</button>
+            <button class="btn btn-speed" data-speed="10">×10</button>
+            <button class="btn btn-speed" data-speed="100">×100</button>
+            <button class="btn btn-speed" data-speed="1000">×1000</button>
+            <span class="separator">|</span>
+            <button id="btn-sync-fleet" class="btn btn-gray" title="Синхронизировать парк станков из config.MACHINES">Sync Fleet</button>
+        </div>
+    </header>
+
+    <main>
+        <section>
+            <h2>Машины <span class="counters" id="counters"></span></h2>
+            <div class="machines-grid" id="machines-grid"></div>
+        </section>
+
+        <section>
+            <h2>Очередь перед печью <span id="queue-furnace-count">(0)</span></h2>
+            <div class="queue-list" id="queue-furnace"></div>
+        </section>
+
+        <section>
+            <h2>Загрузки печей</h2>
+            <div class="furnace-loads" id="furnace-loads"></div>
+        </section>
+
+        <section>
+            <h2>Активные партии <span id="batches-count">(0)</span></h2>
+            <table class="batches-table sortable">
+                <thead>
+                    <tr>
+                        <th data-sort="batch_id">ID</th>
+                        <th data-sort="product_code">Продукт</th>
+                        <th data-sort="priority">Приоритет</th>
+                        <th data-sort="stage">Стадия</th>
+                        <th data-sort="current_machine_id">Станок</th>
+                        <th data-sort="progress">Прогресс</th>
+                        <th data-sort="fails_count">Брак</th>
+                    </tr>
+                </thead>
+                <tbody id="batches-body"></tbody>
+            </table>
+        </section>
+
+        <section>
+            <h2>Открытые наряды <span id="wo-count">(0)</span></h2>
+            <table class="wo-table">
+                <thead>
+                    <tr>
+                        <th>WO</th>
+                        <th>Станок</th>
+                        <th>Тип</th>
+                        <th>Приоритет</th>
+                        <th>Статус</th>
+                        <th>Бригада</th>
+                        <th>Причина</th>
+                    </tr>
+                </thead>
+                <tbody id="wo-body"></tbody>
+            </table>
+        </section>
+    </main>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>
