@@ -52,20 +52,31 @@ class SimulationState:
         self.furnace_loads: dict[str, FurnaceLoad] = {}  # ключ = machine_id
 
         # ─── Очереди задач для подсистем ──
-        # spot-check ожидает обработки Quality: [(batch_id, stage_name), ...]
-        self.pending_spot_checks: deque[tuple[str, str]] = deque()
-        # измерения на финальной инспекции: [(batch_id, part_idx, machine_id, event_time), ...]
-        self.pending_inspection_measurements: deque[tuple[str, int, str, datetime]] = deque()
-        # запросы на ТО по износу инструмента: [machine_id, ...]
+        # Quality: партии, ожидающие обработки после M-GMM-измерения.
+        # Equipment кладёт сюда, когда M-GMM закончил физическую обработку:
+        # (batch_id, stage_after, gmm_id, event_time)
+        # stage_after — этап, после которого партия пришла на измерение.
+        self.pending_measurements: deque[tuple[str, str, str, datetime]] = deque()
+
+        # Maintenance: запросы на ТО по износу инструмента: [machine_id, ...]
         self.pending_tool_change_requests: deque[str] = deque()
+
+        # Maintenance: запросы на ремонт от завершившихся сценариев.
+        # [(machine_id, scenario_type, duration_min), ...]
+        self.pending_scenario_wos: deque[tuple[str, str, float]] = deque()
+
+        # Реестр активных сценариев. ScenariosController перезаписывает его на
+        # каждой регистрации/удалении сценария. Quality читает (через
+        # state.scenarios_registry[scenario_id]) для согласованной деформации.
+        self.scenarios_registry: dict[str, dict] = {}
 
         # ─── Счётчики для дашборда ──
         self.counters: dict[str, int] = {
             "orders_total": 0,
             "batches_total": 0,
             "batches_done": 0,
-            "inspections_pass": 0,
-            "inspections_fail": 0,
+            "parts_pass": 0,
+            "parts_fail": 0,
         }
 
         # ─── ID-генераторы ──
@@ -132,9 +143,10 @@ class SimulationState:
             self.furnace_loads.clear()
 
             # чистим очереди задач для подсистем
-            self.pending_spot_checks.clear()
-            self.pending_inspection_measurements.clear()
+            self.pending_measurements.clear()
             self.pending_tool_change_requests.clear()
+            self.pending_scenario_wos.clear()
+            self.scenarios_registry.clear()
 
             # сбрасываем счётчики
             for key in self.counters:
@@ -168,6 +180,42 @@ class SimulationState:
             return f"FL-{self._load_seq:04d}"
 
     # ─── Снимок для /status ────────────────────────────────────
+    @staticmethod
+    def _batch_snapshot(b) -> dict:
+        """asdict партии + вычисляемое годное количество для UI/прогресса."""
+        d = asdict(b)
+        d["good_quantity"] = b.effective_quantity
+        return d
+
+    def _inspection_station(self, m) -> dict:
+        """Карточка измерительного станка (M-GMM) для отдельной панели UI."""
+        b = self.batches.get(m.current_batch_id) if m.current_batch_id else None
+        plan = m.measurement_plan or []
+        if m.state == "idle":
+            mode = "idle"
+        elif m.state == "setup":
+            mode = "setup"
+        elif any(it.get("mode") == "scenario" for it in plan):
+            mode = "scenario"
+        elif m.measuring_after_stage == "inspection":
+            mode = "final"
+        elif m.measurement_total > 1:
+            mode = "sample"
+        elif m.measurement_total == 1:
+            mode = "spot"
+        else:
+            mode = "—"
+        return {
+            "machine_id": m.machine_id,
+            "state": m.state,
+            "batch_id": m.current_batch_id,
+            "product_code": b.product_code if b else None,
+            "stage_after": m.measuring_after_stage,
+            "parts_total": m.measurement_total,
+            "parts_done": m.measurement_done,
+            "mode": mode,
+        }
+
     def snapshot(self) -> dict:
         with self._lock:
             return {
@@ -175,12 +223,16 @@ class SimulationState:
                 "speed": self.speed,
                 "running": self.running,
                 "machines": [asdict(m) for m in self.machines.values()],
-                "active_batches": [asdict(b) for b in self.batches.values()],
+                "active_batches": [self._batch_snapshot(b) for b in self.batches.values()],
                 "queues": {
                     key: [asdict(b) for b in q]
                     for key, q in self.queues.items()
                 },
                 "furnace_loads": [asdict(fl) for fl in self.furnace_loads.values()],
+                "inspection_stations": [
+                    self._inspection_station(m) for m in self.machines.values()
+                    if m.machine_type == "inspection"
+                ],
                 "open_work_orders": [asdict(wo) for wo in self.work_orders.values()],
                 "brigades": [asdict(b) for b in self.brigades.values()],
                 "counters": dict(self.counters),

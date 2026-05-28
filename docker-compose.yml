@@ -104,6 +104,7 @@ services:
       MAINTENANCE_URL: http://maintenance:8004
     volumes:
       - ./simulator:/app
+      - /var/run/docker.sock:/var/run/docker.sock
     command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8005", "--reload"]
     depends_on:
       - equipment

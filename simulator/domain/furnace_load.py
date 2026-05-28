@@ -13,3 +13,6 @@ class FurnaceLoad:
     phase: str = "loading"       # loading|heating|carburizing|quenching|tempering|unloading
     phase_started_at: datetime | None = None
     last_sensor_sent_at: datetime | None = None
+    # True после того, как части загрузки помечены scenario_marked_indices
+    # (чтобы не помечать повторно при каждом тике).
+    scenario_phase_applied: bool = False

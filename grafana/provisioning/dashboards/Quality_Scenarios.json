@@ -1,0 +1,314 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {"type": "grafana", "uid": "-- Grafana --"},
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "uid": "factory-quality-insights",
+  "title": "Симулятор: сценарии и брак",
+  "tags": ["factory", "quality", "scenarios", "vkr"],
+  "timezone": "browser",
+  "weekStart": "monday",
+  "schemaVersion": 39,
+  "version": 4,
+  "refresh": "5s",
+  "time": {"from": "now-1h", "to": "now"},
+  "timepicker": {
+    "refresh_intervals": ["5s", "10s", "30s", "1m", "5m"]
+  },
+  "templating": {"list": []},
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Активных сценариев",
+      "datasource": {"type": "grafana-postgresql-datasource", "uid": "PCC52D03280B7034C"},
+      "gridPos": {"h": 5, "w": 6, "x": 0, "y": 0},
+      "options": {
+        "graphMode": "none",
+        "colorMode": "background",
+        "textMode": "auto",
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "thresholds": {"mode": "absolute", "steps": [
+            {"color": "green", "value": null},
+            {"color": "orange", "value": 1},
+            {"color": "red", "value": 3}
+          ]},
+          "unit": "none"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {"type": "grafana-postgresql-datasource", "uid": "PCC52D03280B7034C"},
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT count(DISTINCT scenario_id) AS value FROM measurements WHERE scenario_id IS NOT NULL AND measured_at >= (SELECT MAX(measured_at) FROM measurements) - INTERVAL '10 minutes'"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Брак за час",
+      "datasource": {"type": "grafana-postgresql-datasource", "uid": "PCC52D03280B7034C"},
+      "gridPos": {"h": 5, "w": 6, "x": 6, "y": 0},
+      "options": {
+        "graphMode": "area",
+        "colorMode": "value",
+        "textMode": "auto",
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "fixed", "fixedColor": "red"},
+          "unit": "short"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {"type": "grafana-postgresql-datasource", "uid": "PCC52D03280B7034C"},
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT count(*) AS fails FROM measurements WHERE result='fail' AND measured_at >= (SELECT MAX(measured_at) FROM measurements) - INTERVAL '1 hour'"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Pass / Fail (всё время)",
+      "datasource": {"type": "grafana-postgresql-datasource", "uid": "PCC52D03280B7034C"},
+      "gridPos": {"h": 5, "w": 6, "x": 12, "y": 0},
+      "options": {
+        "graphMode": "none",
+        "colorMode": "value",
+        "textMode": "value_and_name",
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+        "orientation": "horizontal"
+      },
+      "fieldConfig": {
+        "defaults": {"unit": "short"},
+        "overrides": [
+          {"matcher": {"id": "byName", "options": "pass"}, "properties": [
+            {"id": "color", "value": {"mode": "fixed", "fixedColor": "green"}}
+          ]},
+          {"matcher": {"id": "byName", "options": "fail"}, "properties": [
+            {"id": "color", "value": {"mode": "fixed", "fixedColor": "red"}}
+          ]}
+        ]
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {"type": "grafana-postgresql-datasource", "uid": "PCC52D03280B7034C"},
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT count(*) FILTER (WHERE result='pass') AS pass, count(*) FILTER (WHERE result='fail') AS fail FROM measurements"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Открытых нарядов",
+      "datasource": {"type": "grafana-postgresql-datasource", "uid": "PCC52D03280B7034C"},
+      "gridPos": {"h": 5, "w": 6, "x": 18, "y": 0},
+      "options": {
+        "graphMode": "none",
+        "colorMode": "background",
+        "textMode": "auto",
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "thresholds": {"mode": "absolute", "steps": [
+            {"color": "green", "value": null},
+            {"color": "orange", "value": 2},
+            {"color": "red", "value": 5}
+          ]},
+          "unit": "none"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {"type": "grafana-postgresql-datasource", "uid": "PCC52D03280B7034C"},
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT count(*) AS value FROM open_work_orders"
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "type": "table",
+      "title": "Активные сценарии (последние 10 мин)",
+      "description": "Что происходит прямо сейчас: какая причина бракует, на каком станке, сколько уже деталей зацепил.",
+      "datasource": {"type": "grafana-postgresql-datasource", "uid": "PCC52D03280B7034C"},
+      "gridPos": {"h": 9, "w": 12, "x": 0, "y": 5},
+      "options": {
+        "showHeader": true,
+        "cellHeight": "md",
+        "footer": {"show": false}
+      },
+      "fieldConfig": {
+        "defaults": {"custom": {"align": "auto", "filterable": false}},
+        "overrides": [
+          {"matcher": {"id": "byName", "options": "fails"}, "properties": [
+            {"id": "custom.cellOptions", "value": {"type": "color-background", "mode": "gradient"}},
+            {"id": "color", "value": {"mode": "continuous-YlRd"}}
+          ]},
+          {"matcher": {"id": "byName", "options": "Последний"}, "properties": [
+            {"id": "unit", "value": "dateTimeAsLocalNoDateIfToday"}
+          ]}
+        ]
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {"type": "grafana-postgresql-datasource", "uid": "PCC52D03280B7034C"},
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT scenario_id AS \"ID\", reason AS \"Сценарий\", source_machine_id AS \"Станок\", count(*) AS fails, count(DISTINCT batch_id) AS \"партий\", MAX(measured_at) AS \"Последний\" FROM measurements WHERE scenario_id IS NOT NULL AND measured_at >= (SELECT MAX(measured_at) FROM measurements) - INTERVAL '10 minutes' GROUP BY scenario_id, reason, source_machine_id ORDER BY MAX(measured_at) DESC"
+        }
+      ]
+    },
+    {
+      "id": 11,
+      "type": "piechart",
+      "title": "Причины брака",
+      "datasource": {"type": "grafana-postgresql-datasource", "uid": "PCC52D03280B7034C"},
+      "gridPos": {"h": 9, "w": 12, "x": 12, "y": 5},
+      "options": {
+        "pieType": "donut",
+        "displayLabels": ["name", "percent"],
+        "legend": {"displayMode": "table", "placement": "right", "values": ["value", "percent"]},
+        "reduceOptions": {"calcs": ["sum"], "fields": "", "values": false},
+        "tooltip": {"mode": "single"}
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "unit": "short"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {"type": "grafana-postgresql-datasource", "uid": "PCC52D03280B7034C"},
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT COALESCE(reason, 'unknown') AS metric, count(*) AS value FROM measurements WHERE result='fail' GROUP BY reason ORDER BY value DESC"
+        }
+      ]
+    },
+    {
+      "id": 20,
+      "type": "barchart",
+      "title": "Pass / Fail по этапам",
+      "datasource": {"type": "grafana-postgresql-datasource", "uid": "PCC52D03280B7034C"},
+      "gridPos": {"h": 9, "w": 12, "x": 0, "y": 14},
+      "options": {
+        "orientation": "horizontal",
+        "stacking": "normal",
+        "showValue": "auto",
+        "barWidth": 0.7,
+        "groupWidth": 0.7,
+        "tooltip": {"mode": "single"},
+        "legend": {"showLegend": true, "displayMode": "list", "placement": "bottom"}
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": [
+          {"matcher": {"id": "byName", "options": "pass"}, "properties": [
+            {"id": "color", "value": {"mode": "fixed", "fixedColor": "green"}}
+          ]},
+          {"matcher": {"id": "byName", "options": "fail"}, "properties": [
+            {"id": "color", "value": {"mode": "fixed", "fixedColor": "red"}}
+          ]}
+        ]
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {"type": "grafana-postgresql-datasource", "uid": "PCC52D03280B7034C"},
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT stage, count(*) FILTER (WHERE result='pass') AS pass, count(*) FILTER (WHERE result='fail') AS fail FROM measurements GROUP BY stage ORDER BY CASE stage WHEN 'turning' THEN 1 WHEN 'hobbing' THEN 2 WHEN 'shaving' THEN 3 WHEN 'heat_treatment' THEN 4 WHEN 'grinding' THEN 5 ELSE 6 END"
+        }
+      ]
+    },
+    {
+      "id": 30,
+      "type": "table",
+      "title": "Последние 15 фейлов",
+      "description": "Самые свежие бракованные измерения. Видно: что мерили, какое значение, какая причина.",
+      "datasource": {"type": "grafana-postgresql-datasource", "uid": "PCC52D03280B7034C"},
+      "gridPos": {"h": 9, "w": 12, "x": 12, "y": 14},
+      "options": {"showHeader": true, "cellHeight": "sm", "footer": {"show": false}},
+      "fieldConfig": {
+        "defaults": {"custom": {"align": "auto", "filterable": false}},
+        "overrides": [
+          {"matcher": {"id": "byName", "options": "reason"}, "properties": [
+            {"id": "custom.cellOptions", "value": {"type": "color-text"}}
+          ]}
+        ]
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {"type": "grafana-postgresql-datasource", "uid": "PCC52D03280B7034C"},
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT measured_at AS \"Время\", batch_id AS \"Партия\", stage AS \"Этап\", parameter AS \"Параметр\", ROUND(value::numeric, 2) AS \"Значение\", reason AS \"Причина\", COALESCE(source_machine_id, '—') AS \"Виновник\" FROM measurements WHERE result='fail' ORDER BY measured_at DESC LIMIT 15"
+        }
+      ]
+    },
+    {
+      "id": 40,
+      "type": "logs",
+      "title": "События: сценарии, наряды, alarms (live)",
+      "description": "Старт/завершение сценариев, создание/закрытие work orders, alarms (например, превышение износа инструмента).",
+      "datasource": {"type": "loki", "uid": "P8E80F9AEF21F6940"},
+      "gridPos": {"h": 12, "w": 24, "x": 0, "y": 23},
+      "options": {
+        "showTime": true,
+        "showLabels": true,
+        "showCommonLabels": false,
+        "wrapLogMessage": true,
+        "prettifyLogMessage": true,
+        "enableLogDetails": true,
+        "dedupStrategy": "none",
+        "sortOrder": "Descending"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {"type": "loki", "uid": "P8E80F9AEF21F6940"},
+          "expr": "{event=~\"scenario_event|work_order_creation|work_order_completion|alarm\"}",
+          "queryType": "range",
+          "maxLines": 200
+        }
+      ]
+    }
+  ]
+}

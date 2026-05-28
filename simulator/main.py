@@ -1,7 +1,9 @@
 """FastAPI control API симулятора."""
 import logging
 import os
+import threading
 
+import docker as docker_sdk
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -34,19 +36,21 @@ disable_logging()
 # ─── глобальное состояние ────────────────────────────────────
 state = SimulationState()
 client = FactoryClient()
-scenarios = ScenariosController(state)
+scenarios = ScenariosController(state, client=client)
+orders_sub = OrdersSubsystem(state, client)
+quality_sub = QualitySubsystem(state, client)
 
 subsystems = [
-    OrdersSubsystem(state, client),
+    orders_sub,
     ProductionDispatcher(state, client),
-    EquipmentSubsystem(state, client),
+    EquipmentSubsystem(state, client, quality_sub),
     FurnaceSubsystem(state, client),
-    QualitySubsystem(state, client),
+    quality_sub,
     MaintenanceSubsystem(state, client),
-    scenarios,  # scenarios.tick() обрабатывает завершение по таймеру
+    scenarios,
 ]
 
-loop = SimulationLoop(state, subsystems)                                                 
+loop = SimulationLoop(state, subsystems)
 
 # ─── FastAPI ──────────────────────────────────────────────────
 app = FastAPI(title="Factory Simulator")
@@ -61,34 +65,29 @@ class SpeedRequest(BaseModel):
     multiplier: float
 
 
-class ToolWearRequest(BaseModel):
+class StartScenarioRequest(BaseModel):
     machine_id: str
-    duration_min: float = 60.0
-    intensity: float = 1.5
+    scenario_type: str
+    severity: str = config.DEFAULT_SEVERITY
+    parts_limit: int = 30
 
 
-class BearingOverheatRequest(BaseModel):
-    machine_id: str
-    duration_min: float = 30.0
-    intensity: float = 1.4
+class StopScenarioRequest(BaseModel):
+    scenario_id: str
 
 
-class FurnaceDriftRequest(BaseModel):
-    machine_id: str
-    zone: int = 2
-    duration_min: float = 60.0
-    drift_pct: float = 0.05
+class AutoScenariosRequest(BaseModel):
+    enabled: bool
 
 
-class CoolantFailureRequest(BaseModel):
-    machine_id: str
-    duration_min: float = 20.0
+class CreateOrderRequest(BaseModel):
+    product_code: str
+    priority: str = "normal"
+    total_quantity: int = 100
 
 
-class QualityBurstRequest(BaseModel):
-    work_center: str
-    duration_min: float = 60.0
-    fail_rate: float = 0.15
+class AutoOrdersRequest(BaseModel):
+    enabled: bool
 
 
 # ─── endpoints ───────────────────────────────────────────────
@@ -99,7 +98,10 @@ def health():
 
 @app.get("/status")
 def get_status():
-    return state.snapshot()
+    snap = state.snapshot()
+    snap["active_scenarios"] = scenarios.list_active()
+    snap["auto_orders"] = orders_sub.get_auto_status()
+    return snap
 
 
 @app.post("/start")
@@ -114,9 +116,21 @@ def stop():
     return {"ok": True, "running": state.running}
 
 
+def _clear_loki_async() -> None:
+    """Удаляет все данные Loki и перезапускает контейнер (в фоне)."""
+    try:
+        dc = docker_sdk.from_env()
+        loki = dc.containers.get("loki")
+        loki.exec_run("sh -c 'rm -rf /loki/chunks /loki/wal /loki/tsdb-shipper-active /loki/tsdb-shipper-cache /loki/compactor'")
+        loki.restart(timeout=10)
+    except Exception as exc:
+        logging.getLogger("simulator.restart").warning("Loki cleanup failed: %s", exc)
+
+
 @app.post("/restart")
 def restart():
     loop.restart()
+    threading.Thread(target=_clear_loki_async, daemon=True).start()
     return {"ok": True, "running": state.running}
 
 
@@ -142,50 +156,75 @@ def set_speed(req: SpeedRequest):
     return {"ok": True, "speed": state.speed}
 
 
-# ─── scenarios endpoints (заготовки) ─────────────────────────
+# ─── scenarios endpoints ─────────────────────────────────────
 @app.get("/scenarios")
 def list_scenarios():
-    return {"active": scenarios.list_active()}
+    return {
+        "active": scenarios.list_active(),
+        "catalog": scenarios.catalog(),
+        "severity_levels": list(config.SEVERITY_LEVELS.keys()),
+        "auto": scenarios.get_auto_status(),
+    }
 
 
-@app.post("/scenarios/tool-wear")
-def scn_tool_wear(req: ToolWearRequest):
-    sid = scenarios.start_tool_wear_acceleration(
-        req.machine_id, req.duration_min, req.intensity)
-    return {"scenario_id": sid}
+@app.post("/scenarios/auto")
+def set_auto_scenarios(req: AutoScenariosRequest):
+    scenarios.set_auto_enabled(req.enabled)
+    return {"ok": True, "auto": scenarios.get_auto_status()}
 
 
-@app.post("/scenarios/bearing-overheat")
-def scn_bearing(req: BearingOverheatRequest):
-    sid = scenarios.start_bearing_overheat(
-        req.machine_id, req.duration_min, req.intensity)
-    return {"scenario_id": sid}
+@app.post("/scenarios/start")
+def start_scenario(req: StartScenarioRequest):
+    try:
+        sid = scenarios.start_scenario(
+            machine_id=req.machine_id,
+            scenario_type=req.scenario_type,
+            severity=req.severity,
+            parts_limit=req.parts_limit,
+        )
+        return {"ok": True, "scenario_id": sid}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
-@app.post("/scenarios/furnace-drift")
-def scn_furnace(req: FurnaceDriftRequest):
-    sid = scenarios.start_furnace_drift(
-        req.machine_id, req.zone, req.duration_min, req.drift_pct)
-    return {"scenario_id": sid}
-
-
-@app.post("/scenarios/coolant-failure")
-def scn_coolant(req: CoolantFailureRequest):
-    sid = scenarios.start_coolant_failure(req.machine_id, req.duration_min)
-    return {"scenario_id": sid}
-
-
-@app.post("/scenarios/quality-burst")
-def scn_quality(req: QualityBurstRequest):
-    sid = scenarios.start_quality_burst(
-        req.work_center, req.duration_min, req.fail_rate)
-    return {"scenario_id": sid}
+@app.post("/scenarios/stop")
+def stop_scenario(req: StopScenarioRequest):
+    ok = scenarios.stop_scenario(req.scenario_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="scenario not found")
+    return {"ok": True}
 
 
 @app.post("/scenarios/stop-all")
 def scn_stop_all():
     n = scenarios.stop_all()
     return {"stopped": n}
+
+
+# ─── orders endpoints ────────────────────────────────────────
+@app.get("/orders/auto")
+def get_auto_orders():
+    return orders_sub.get_auto_status()
+
+
+@app.post("/orders/auto")
+def set_auto_orders(req: AutoOrdersRequest):
+    orders_sub.set_auto_enabled(req.enabled)
+    return {"ok": True, "auto": orders_sub.get_auto_status()}
+
+
+@app.post("/orders/create")
+def create_order(req: CreateOrderRequest):
+    try:
+        result = orders_sub.create_order(
+            product_code=req.product_code,
+            priority=req.priority,
+            total_quantity=req.total_quantity,
+            now=state.virtual_time,
+        )
+        return {"ok": True, **result}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 # ─── WebUI ────────────────────────────────────────────────────

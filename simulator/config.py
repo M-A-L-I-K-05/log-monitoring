@@ -4,7 +4,7 @@ from datetime import datetime
 
 # ─── Реальное время ────────────────────────────────────────────
 TICK_REAL_SEC = 0.1          # 100 мс на тик
-HTTP_TIMEOUT_SEC = 2.0
+HTTP_TIMEOUT_SEC = 10.0
 
 # ─── Виртуальное время ─────────────────────────────────────────
 SIM_START_TIME = datetime(2026, 1, 1, 8, 0, 0)
@@ -12,8 +12,9 @@ DEFAULT_SPEED = 1.0
 ALLOWED_SPEEDS = [1, 10, 100, 1000]
 
 # ─── Общие тайминги (виртуальные секунды) ──────────────────────
-SETUP_TIME_SEC = 420         # 7 минут наладки
-COOLDOWN_TIME_SEC = 300      # 5 минут после партии до idle
+SETUP_TIME_SEC = 420         # 7 минут наладки (обрабатывающие станки: смена резца/фрезы)
+INSPECTION_SETUP_TIME_SEC = 120  # 2 минуты для M-GMM: закрепление детали + калибровка зонда
+COOLDOWN_TIME_SEC = 300      # 5 минут после партии до idle (только обрабатывающие)
 SENSOR_INTERVAL_SEC = 15     # между sensor_readings одного станка
 
 # ─── Тайминги обработки на участках (на одну деталь) ───────────
@@ -22,7 +23,7 @@ CYCLE_TIME_SEC = {
     "hobbing":    600,   # 10 мин — узкое место
     "shaving":    120,   # 2 мин
     "grinding":   180,   # 3 мин
-    "inspection": 60,    # 1 мин на инспектируемую (10% выборка)
+    "inspection": 60,    # 1 мин на инспектируемую (10% выборка) — fallback
 }
 
 # ─── Износ инструмента за один цикл (0.0..1.0) ─────────────────
@@ -36,7 +37,7 @@ TOOL_WEAR_PER_CYCLE = {
 TOOL_WEAR_TRIGGER = 0.95     # триггер для maintenance work_order
 
 # ─── Заказы ────────────────────────────────────────────────────
-ORDER_INTERVAL_MIN_RANGE = (40, 80)  # 4–8 виртуальных часов
+ORDER_INTERVAL_MIN_RANGE = (240, 480)  # 4–8 виртуальных часов
 ORDER_SIZES = [
     (100, 0.70),
     (200, 0.20),
@@ -132,6 +133,8 @@ QUEUE_BEFORE = {
 ALL_QUEUE_KEYS = [
     "pending", "queue_hobbing", "queue_shaving",
     "waiting_furnace", "queue_grinding", "queue_inspection",
+    # Очередь на измерение перед M-GMM (используется после каждого этапа):
+    "queue_measurement",
 ]
 
 # ─── Печь ──────────────────────────────────────────────────────
@@ -163,57 +166,315 @@ BRIGADES = ["B-MECH-01", "B-MECH-02", "B-MECH-03"]
 
 # ─── Quality ───────────────────────────────────────────────────
 INSPECTION_SAMPLE_RATIO = 0.10        # 10% выборка на финальной инспекции
-BACKGROUND_FAIL_RATE = 0.015          # 1.5% фоновый брак
-MEASUREMENTS_PER_PART_RANGE = (3, 5)  # сколько параметров измеряем
-# Точки промежуточного контроля (spot-check)
-SPOT_CHECK_STAGES = ["hobbing", "heat_treatment"]
+# Этапов с измерением 5 (turning, hobbing, shaving, heat_treatment, grinding) +
+# финальная инспекция. На каждом этапе проверка одной детали с фоновым
+# fail-rate 0.3%. Общий фон по маршруту ≈ 1.5%.
+BACKGROUND_FAIL_RATE = 0.003
 SPOT_CHECK_NEIGHBORS_ON_FAIL = 2      # сколько соседних проверить если fail
 
 # ─── Спецификации измерений по product_code ───────────────────
 # Класс точности AGMA Q10–Q11 (ISO 6–7) для всех типоразмеров.
-# Допуски масштабируются по физике: profile ∝ модуль^0.4, runout ∝ √D,
-# pitch ∝ модуль^0.3, lead ∝ ширина зуба (≈ модуль), Ra после шлифования
-# почти одинакова но для крупных шестерен чуть хуже.
-# Формат: (nominal, tolerance, unit). Реальное измеряемое значение —
-# nominal + случайный шум в пределах tolerance.
-# Для lead_deviation на косозубых — nominal не 0, а угол наклона
-# (но измеряем ОТКЛОНЕНИЕ от номинала, поэтому семантика та же — допуск
-# в мкм отклонения от заданной линии зуба).
+# Формат спеки — кортеж:
+#   ("deviation", nominal, tolerance, unit)
+#     → отклонение от номинала: pass если value in [nominal, nominal+tolerance]
+#       (для геометрии: nominal=0, измеряется модуль отклонения от линии зуба).
+#   ("range", min, max, unit)
+#     → диапазонный параметр (твёрдость, слой): pass если value in [min, max].
+#
+# При генерации:
+#   - deviation: значение генерируется в [nominal+0.1*tol, nominal+0.95*tol]
+#   - range:     значение генерируется в [min+0.2*(max-min), max-0.2*(max-min)]
+#   При fail (фон или сценарий) — за границу с заданным направлением.
 MEASUREMENT_SPECS_BY_PRODUCT = {
     "SPUR-S": {
-        "profile_deviation": (0.0, 11.0, "um"),
-        "lead_deviation":    (0.0, 12.0, "um"),
-        "pitch_deviation":   (0.0, 10.0, "um"),
-        "runout":            (0.0, 16.0, "um"),
-        "surface_roughness": (0.0, 1.0,  "um"),
+        "blank_runout":         ("deviation", 0.0, 20.0, "um"),
+        "profile_deviation":    ("deviation", 0.0, 11.0, "um"),
+        "lead_deviation":       ("deviation", 0.0, 12.0, "um"),
+        "pitch_deviation":      ("deviation", 0.0, 10.0, "um"),
+        "runout":               ("deviation", 0.0, 16.0, "um"),
+        "surface_hardness_hrc": ("range", 58.0, 62.0, "HRC"),
+        "core_hardness_hrc":    ("range", 30.0, 40.0, "HRC"),
+        "case_depth_mm":        ("range", 0.8, 1.2, "mm"),
+        "surface_roughness":    ("deviation", 0.0, 1.0,  "um"),
     },
-    "SPUR-M": {  # baseline (соответствует исходным TOLERANCES)
-        "profile_deviation": (0.0, 14.0, "um"),
-        "lead_deviation":    (0.0, 16.0, "um"),
-        "pitch_deviation":   (0.0, 12.0, "um"),
-        "runout":            (0.0, 22.0, "um"),
-        "surface_roughness": (0.0, 1.2,  "um"),
+    "SPUR-M": {  # baseline
+        "blank_runout":         ("deviation", 0.0, 22.0, "um"),
+        "profile_deviation":    ("deviation", 0.0, 14.0, "um"),
+        "lead_deviation":       ("deviation", 0.0, 16.0, "um"),
+        "pitch_deviation":      ("deviation", 0.0, 12.0, "um"),
+        "runout":               ("deviation", 0.0, 22.0, "um"),
+        "surface_hardness_hrc": ("range", 58.0, 62.0, "HRC"),
+        "core_hardness_hrc":    ("range", 30.0, 40.0, "HRC"),
+        "case_depth_mm":        ("range", 0.8, 1.2, "mm"),
+        "surface_roughness":    ("deviation", 0.0, 1.2,  "um"),
     },
     "HEL-M": {
-        # косозубая: lead жёстче (контроль угла наклона критичнее),
-        # остальное близко к SPUR-M
-        "profile_deviation": (0.0, 14.0, "um"),
-        "lead_deviation":    (0.0, 14.0, "um"),
-        "pitch_deviation":   (0.0, 12.0, "um"),
-        "runout":            (0.0, 22.0, "um"),
-        "surface_roughness": (0.0, 1.2,  "um"),
+        "blank_runout":         ("deviation", 0.0, 22.0, "um"),
+        "profile_deviation":    ("deviation", 0.0, 14.0, "um"),
+        "lead_deviation":       ("deviation", 0.0, 14.0, "um"),
+        "pitch_deviation":      ("deviation", 0.0, 12.0, "um"),
+        "runout":               ("deviation", 0.0, 22.0, "um"),
+        "surface_hardness_hrc": ("range", 58.0, 62.0, "HRC"),
+        "core_hardness_hrc":    ("range", 30.0, 40.0, "HRC"),
+        "case_depth_mm":        ("range", 0.8, 1.2, "mm"),
+        "surface_roughness":    ("deviation", 0.0, 1.2,  "um"),
     },
     "HEL-L": {
-        # большая косозубая: всё мягче (физически сложнее держать точность
-        # на крупных шестернях при том же классе AGMA)
-        "profile_deviation": (0.0, 18.0, "um"),
-        "lead_deviation":    (0.0, 18.0, "um"),
-        "pitch_deviation":   (0.0, 14.0, "um"),
-        "runout":            (0.0, 30.0, "um"),
-        "surface_roughness": (0.0, 1.4,  "um"),
+        "blank_runout":         ("deviation", 0.0, 28.0, "um"),
+        "profile_deviation":    ("deviation", 0.0, 18.0, "um"),
+        "lead_deviation":       ("deviation", 0.0, 18.0, "um"),
+        "pitch_deviation":      ("deviation", 0.0, 14.0, "um"),
+        "runout":               ("deviation", 0.0, 30.0, "um"),
+        "surface_hardness_hrc": ("range", 58.0, 62.0, "HRC"),
+        "core_hardness_hrc":    ("range", 30.0, 40.0, "HRC"),
+        "case_depth_mm":        ("range", 0.8, 1.2, "mm"),
+        "surface_roughness":    ("deviation", 0.0, 1.4,  "um"),
     },
 }
 ALL_MEASUREMENT_PARAMS = list(MEASUREMENT_SPECS_BY_PRODUCT["SPUR-M"].keys())
+
+# ─── Направления выхода значения за допуск ─────────────────────
+# Для каждого параметра разрешённое направление при fail:
+#   "up"   — только за верхнюю границу,
+#   "down" — только за нижнюю,
+#   "both" — в любую сторону.
+# Геометрические отклонения всегда растут (износ, биение и т.п.).
+# Твёрдость/слой могут уходить в обе стороны, но физически чаще ↓
+# (недостаточная цементация/закалка).
+PARAM_FAIL_DIRECTION = {
+    "blank_runout":         "up",
+    "profile_deviation":    "up",
+    "pitch_deviation":      "up",
+    "lead_deviation":       "up",
+    "runout":               "up",
+    "surface_roughness":    "up",
+    "surface_hardness_hrc": "both",
+    "core_hardness_hrc":    "both",
+    "case_depth_mm":        "both",
+}
+
+# ─── Таблица A: какие параметры меряются после каждого этапа ──
+# «Новые» = этап их создаёт. «Перемер» = этап физически влияет, проверяем повторно.
+# Финальная inspection — все 8 параметров (полный контроль).
+STAGE_MEASUREMENTS = {
+    "turning":        ["blank_runout"],
+    "hobbing":        ["profile_deviation", "pitch_deviation",
+                       "lead_deviation", "runout"],
+    "shaving":        ["profile_deviation", "lead_deviation"],
+    "heat_treatment": ["surface_hardness_hrc", "core_hardness_hrc",
+                       "case_depth_mm", "runout", "lead_deviation"],
+    "grinding":       ["surface_roughness", "profile_deviation",
+                       "runout", "surface_hardness_hrc"],
+    "inspection":     ["blank_runout", "profile_deviation", "pitch_deviation",
+                       "lead_deviation", "runout", "surface_hardness_hrc",
+                       "core_hardness_hrc", "case_depth_mm", "surface_roughness"],
+}
+
+# ─── Тайминги измерения по этапам (виртуальные секунды на 1 деталь) ─
+# Время-на-деталь на M-GMM (KLINGELNBERG-P26). Чем больше параметров проверяем
+# и сложнее этап — тем дольше. Финальная inspection — самая длительная,
+# проверяется полный набор по всем 8 параметрам.
+INSPECTION_TIME_PER_PART_SEC = {
+    "turning":        60,    # 1 мин — только blank_runout
+    "hobbing":        240,   # 4 мин — 4 геометрических параметра
+    "shaving":        120,   # 2 мин — 2 параметра
+    "heat_treatment": 360,   # 6 мин — твёрдость + слой + перемер геометрии
+    "grinding":       240,   # 4 мин — 4 параметра + контроль hardness
+    "inspection":     480,   # 8 мин — полный контроль по 9 параметрам
+}
+
+# ─── Сценарии аномалий (Таблица B) ─────────────────────────────
+# Каждый сценарий: имя_причины → {
+#   "sensors":     dict сенсор → множитель (от нормы; >1 = рост, <1 = падение),
+#   "measurements": dict параметр → "up"|"down"|"both" (направление выхода
+#                  за допуск; должно быть совместимо с PARAM_FAIL_DIRECTION),
+#   "wo_duration_min": длительность ремонта (для maintenance WO),
+#   "applies_to":  множество machine_type, к которым применим (для UI),
+# }
+# Реестр организован по типу станка — UI берёт только подходящие сценарию.
+SCENARIOS_BY_MACHINE_TYPE = {
+    # TURNING (1)
+    "turning": {
+        "tool_wear": {
+            "sensors": {
+                "vibration_rms_mm_s": 1.5,
+                "spindle_load_percent": 1.3,
+                "spindle_bearing_temp": 1.15,
+            },
+            "measurements": {"blank_runout": "up"},
+            "wo_duration_min": 25,
+        },
+    },
+    # HOBBING (3)
+    "hobbing": {
+        "hob_wear": {
+            "sensors": {
+                "vibration_rms_mm_s": 1.45,
+                "spindle_load_percent": 1.30,
+                "hob_bearing_temp": 1.15,
+            },
+            "measurements": {
+                "profile_deviation": "up",
+                "pitch_deviation": "up",
+            },
+            "wo_duration_min": 35,
+        },
+        "chatter": {
+            "sensors": {
+                "vibration_rms_mm_s": 1.80,
+                "spindle_load_percent": 1.25,
+            },
+            "measurements": {"profile_deviation": "up"},
+            "wo_duration_min": 30,
+        },
+        "workpiece_loose": {
+            "sensors": {
+                "vibration_rms_mm_s": 1.50,
+                "work_spindle_rpm": 1.10,   # нестабильно: фон, мы лишь повышаем mean
+            },
+            "measurements": {
+                "runout": "up",
+                "lead_deviation": "up",
+            },
+            "wo_duration_min": 20,
+        },
+    },
+    # SHAVING (1)
+    "shaving": {
+        "shaver_wear": {
+            "sensors": {
+                "vibration_rms_mm_s": 1.40,
+                "spindle_load_percent": 1.25,
+            },
+            "measurements": {
+                "profile_deviation": "up",
+                "lead_deviation": "up",
+            },
+            "wo_duration_min": 25,
+        },
+    },
+    # FURNACE (3)
+    "furnace": {
+        "under_carburizing": {
+            "trigger_phase": "carburizing",
+            "sensors": {
+                "carbon_potential": 0.75,
+                "furnace_temp_zone1": 0.97,
+                "furnace_temp_zone2": 0.97,
+                "furnace_temp_zone3": 0.97,
+            },
+            "measurements": {
+                "surface_hardness_hrc": "down",
+                "case_depth_mm": "down",
+            },
+            "wo_duration_min": 180,
+        },
+        "over_carburizing": {
+            "trigger_phase": "carburizing",
+            "sensors": {
+                "carbon_potential": 1.30,
+                "furnace_temp_zone1": 1.03,
+                "furnace_temp_zone2": 1.03,
+                "furnace_temp_zone3": 1.03,
+            },
+            "measurements": {
+                "surface_hardness_hrc": "up",
+                "case_depth_mm": "up",
+                "core_hardness_hrc": "up",
+            },
+            "wo_duration_min": 150,
+        },
+        "quench_distortion": {
+            "trigger_phase": "quenching",
+            "sensors": {
+                "quench_oil_flow": 0.40,
+                "quench_oil_temp": 1.30,
+            },
+            "measurements": {
+                "runout": "up",
+                "lead_deviation": "up",
+            },
+            "wo_duration_min": 120,
+        },
+    },
+    # GRINDING (3)
+    "grinding": {
+        "grinding_chatter": {
+            "sensors": {
+                "vibration_rms_mm_s": 1.80,
+                "wheel_bearing_temp": 1.15,
+            },
+            "measurements": {
+                "surface_roughness": "up",
+                "profile_deviation": "up",
+            },
+            "wo_duration_min": 30,
+        },
+        "coolant_loss": {
+            "sensors": {
+                "coolant_flow": 0.30,
+                "coolant_temp_c": 1.35,
+            },
+            "measurements": {
+                "surface_roughness": "up",
+                "runout": "up",
+            },
+            "wo_duration_min": 25,
+        },
+        "grinding_burn": {
+            "sensors": {
+                "coolant_flow": 0.55,
+                "spindle_power_kw": 1.80,
+            },
+            "measurements": {
+                "surface_hardness_hrc": "down",
+                "surface_roughness": "up",
+            },
+            "wo_duration_min": 40,
+        },
+    },
+}
+
+# ─── Severity: уровни тяжести сценария ─────────────────────────
+# Тяжесть масштабирует:
+#   1) силу искажения сенсоров вокруг 1.0 (множитель → 1 + (mult-1)*sensor_scale),
+#   2) величину выхода измерения за границу допуска (фактор × ширина допуска).
+# Доля брака внутри окна сценария — всегда 100% (если параметр вышел за
+# допуск, деталь бракуется по определению).
+SEVERITY_LEVELS = {
+    "light":  {"sensor_scale": 0.6,  "measure_excess": (0.05, 0.25)},
+    "clear":  {"sensor_scale": 1.0,  "measure_excess": (0.25, 0.60)},
+    "gross":  {"sensor_scale": 1.5,  "measure_excess": (0.60, 1.20)},
+}
+DEFAULT_SEVERITY = "clear"
+
+# Дефолтный фоновый excess: фон — это "лёгкий" выход за допуск.
+BACKGROUND_FAIL_EXCESS = (0.05, 0.25)
+
+# ─── Авто-режим сценариев (опционально) ─────────────────────────
+# Когда включён: ScenariosController.tick() сам периодически запускает
+# случайный сценарий на случайном подходящем станке (running/setup/cooldown
+# с current_batch_id, без активного сценария).
+# Самозавершение и ремонт — те же, что при ручном запуске.
+#
+# Обоснование интервала 360–1080 виртуальных минут (6–18 ч):
+#   - средний цикл партии 80 деталей ≈ 15–20ч; интервал даёт 1–4 сценария
+#     в виртуальные сутки → ~10–20% измерений с причиной + 80% baseline,
+#     что хорошо ложится в задачу обучения (сенсор → дефект),
+#   - между сценариями станок успевает завершить хотя бы одну партию
+#     в норме — ML получает чистые сэмплы для «здорового» класса,
+#   - не слишком часто → нет коллизий двух сценариев на одном станке.
+AUTO_SCENARIOS_ENABLED = True
+AUTO_SCENARIOS_INTERVAL_MIN_RANGE = (360, 1080)  # 6–18 виртуальных часов
+AUTO_SCENARIOS_SEVERITY_WEIGHTS = [
+    ("light", 0.30),
+    ("clear", 0.50),
+    ("gross", 0.20),
+]
+AUTO_SCENARIOS_PARTS_LIMIT_RANGE = (10, 30)
+# Если не нашли подходящего станка — повтор через короткий backoff,
+# чтобы не ждать ещё 6 часов.
+AUTO_SCENARIOS_RETRY_MIN_RANGE = (15, 45)
 
 # ─── Парк станков ─────────────────────────────────────────────
 # (machine_id, machine_type, work_center, model)

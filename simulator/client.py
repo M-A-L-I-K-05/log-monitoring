@@ -48,12 +48,17 @@ class FactoryClient:
 
     # ─── reset (вызывается при /restart симулятора) ───────────
     def reset_remote_state(self) -> None:
-        """Сбросить БД-таблицы трёх сервисов в исходное состояние.
+        """Сбросить БД-таблицы всех 4 сервисов в исходное состояние.
+        equipment: machine_status → idle
+        production: TRUNCATE active_batches
+        quality:    TRUNCATE measurements RESTART IDENTITY
+        maintenance: TRUNCATE open_work_orders
         Игнорирует ошибки отдельных сервисов (если один лежит — остальные сбросятся)."""
         self._sensor_buffer = []
         self._cycle_buffer = []
         self._measurement_buffer = []
-        for url in (self.eq + "/reset", self.pr + "/reset", self.mt + "/reset"):
+        for url in (self.eq + "/reset", self.pr + "/reset",
+                    self.qa + "/reset", self.mt + "/reset"):
             try:
                 self._session.post(url, timeout=config.HTTP_TIMEOUT_SEC)
             except Exception:
@@ -181,19 +186,48 @@ class FactoryClient:
         })
 
     # ─── QUALITY ───────────────────────────────────────────────
-    def measurement(self, batch_id: str, part_id: str, work_center: str,
-                    parameter: str, value: float, nominal: float, tolerance: float,
-                    unit: str, event_time: datetime) -> None:
+    def measurement(self, batch_id: str, part_id: str, part_index: int,
+                    product_code: str, stage: str, machine_id: str,
+                    work_center: str, parameter: str, value: float,
+                    nominal: float, tolerance: float, unit: str,
+                    result: str, event_time: datetime,
+                    reason: str | None = None,
+                    source_machine_id: str | None = None,
+                    scenario_id: str | None = None) -> None:
         self._measurement_buffer.append({
-            "batch_id":    batch_id,
-            "part_id":     part_id,
-            "work_center": work_center,
-            "parameter":   parameter,
-            "value":       value,
-            "nominal":     nominal,
-            "tolerance":   tolerance,
-            "unit":        unit,
-            "event_time":  event_time.isoformat(),
+            "batch_id":          batch_id,
+            "part_id":           part_id,
+            "part_index":        part_index,
+            "product_code":      product_code,
+            "stage":             stage,
+            "machine_id":        machine_id,
+            "work_center":       work_center,
+            "parameter":         parameter,
+            "value":             value,
+            "nominal":           nominal,
+            "tolerance":         tolerance,
+            "unit":              unit,
+            "result":            result,
+            "reason":            reason,
+            "source_machine_id": source_machine_id,
+            "scenario_id":       scenario_id,
+            "event_time":        event_time.isoformat(),
+        })
+
+    def scenario_event(self, event: str, scenario_id: str, machine_id: str,
+                       scenario_type: str, severity: str | None,
+                       parts_limit: int | None, event_time: datetime,
+                       details: dict | None = None) -> None:
+        """Лог запуска/остановки сценария — для ML и для трассировки."""
+        self._post(self.qa + "/scenario-event", {
+            "event":         event,
+            "scenario_id":   scenario_id,
+            "machine_id":    machine_id,
+            "scenario_type": scenario_type,
+            "severity":      severity,
+            "parts_limit":   parts_limit,
+            "details":       details or {},
+            "event_time":    event_time.isoformat(),
         })
 
     def inspection_result(self, part_id: str, batch_id: str, work_center: str,

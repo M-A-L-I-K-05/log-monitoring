@@ -43,3 +43,32 @@ CREATE TABLE open_work_orders (
     created_at         TIMESTAMP   NOT NULL,
     assigned_at        TIMESTAMP
 );
+
+
+-- Длинный формат: одна строка = одно измерение одного параметра одной детали.
+-- Удобно для Grafana GROUP BY и SQL-аналитики. Дефекты = WHERE result='fail'.
+-- ML по-прежнему ест логи (дублирование намеренное).
+CREATE TABLE measurements (
+    measurement_id    BIGSERIAL   PRIMARY KEY,
+    batch_id          TEXT        NOT NULL,
+    part_index        INTEGER     NOT NULL,
+    product_code      TEXT        NOT NULL,
+    stage             TEXT        NOT NULL,
+    machine_id        TEXT        NOT NULL,   -- где обрабатывалась деталь
+    parameter         TEXT        NOT NULL,
+    value             REAL        NOT NULL,
+    nominal           REAL        NOT NULL,
+    tolerance         REAL        NOT NULL,
+    unit              TEXT        NOT NULL,
+    result            TEXT        NOT NULL,   -- pass | fail
+    reason            TEXT,                   -- причина при fail; NULL при pass
+    source_machine_id TEXT,                   -- станок-виновник; NULL при фоне/pass
+    scenario_id       TEXT,                   -- id сценария; NULL иначе
+    measured_at       TIMESTAMP   NOT NULL
+);
+
+CREATE INDEX measurements_batch_idx     ON measurements (batch_id);
+CREATE INDEX measurements_stage_idx     ON measurements (stage);
+CREATE INDEX measurements_result_idx    ON measurements (result);
+CREATE INDEX measurements_scenario_idx  ON measurements (scenario_id);
+CREATE INDEX measurements_measured_at_idx ON measurements (measured_at);

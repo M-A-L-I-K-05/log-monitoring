@@ -7,8 +7,10 @@ body {
 }
 header {
     background: #2a2a2a;
-    padding: 1rem 1.5rem;
+    padding: 0.75rem 1.5rem;
     display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
     justify-content: space-between;
     align-items: center;
     border-bottom: 1px solid #444;
@@ -27,12 +29,17 @@ header h1 { margin: 0 0 0.25rem 0; font-size: 1.4rem; }
 .running-badge.is-on { background: #28a745; }
 .running-badge.is-off { background: #6c757d; }
 
-.controls { display: flex; gap: 0.4rem; align-items: center; flex-wrap: wrap; }
+.controls { display: flex; gap: 0.4rem; align-items: center; flex-wrap: wrap; flex-shrink: 1; min-width: 0; }
+.controls .btn { font-size: 0.82rem; padding: 0.35rem 0.7rem; }
+.controls .btn-speed { font-size: 0.78rem; padding: 0.3rem 0.5rem; }
 .separator { color: #666; margin: 0 0.3rem; }
 .btn {
     padding: 0.45rem 0.9rem; border: none; border-radius: 4px; color: white;
     cursor: pointer; font-size: 0.9rem;
 }
+.btn-tiny { padding: 0.18rem 0.5rem; font-size: 0.75rem; margin-left: 0.5rem; }
+.auto-toggle { margin-left: 1rem; font-size: 0.82rem; font-weight: normal; color: #ccc; cursor: pointer; vertical-align: middle; }
+.auto-toggle input { margin-right: 0.3rem; cursor: pointer; }
 .btn-green { background: #28a745; }
 .btn-blue { background: #007bff; }
 .btn-red { background: #dc3545; }
@@ -48,10 +55,11 @@ section h2 {
     border-bottom: 1px solid #444;
 }
 .counters { font-size: 0.85rem; color: #999; font-weight: normal; }
+.hint { color: #777; font-size: 0.8rem; margin: 0 0 0.5rem 0; }
 
 .machines-grid {
     display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+    grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
     gap: 0.6rem;
 }
 .machine-cell {
@@ -60,12 +68,25 @@ section h2 {
     border-radius: 4px;
     border-left: 4px solid #888;
     font-size: 0.85rem;
+    cursor: pointer;
+    transition: background 0.15s;
 }
+.machine-cell:hover { background: #333; }
+.machine-cell.has-scenario { background: #2e2018; }
 .m-id { font-weight: bold; color: #fff; }
 .m-type { color: #999; font-size: 0.75rem; }
 .m-state { font-weight: bold; margin-top: 0.3rem; }
 .m-batch { font-family: monospace; font-size: 0.78rem; color: #aaa; }
 .m-wear { font-size: 0.75rem; color: #999; }
+.m-scenario {
+    margin-top: 0.35rem;
+    padding: 0.2rem 0.4rem;
+    font-size: 0.7rem;
+    font-weight: bold;
+    color: white;
+    border-radius: 3px;
+    text-align: center;
+}
 
 .queue-list { display: flex; flex-wrap: wrap; gap: 0.3rem; }
 .chip {
@@ -89,7 +110,6 @@ section h2 {
 
 table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
 
-/* Сортируемая таблица: заголовки кликабельны, активный показывает ▲/▼ */
 table.sortable th[data-sort] {
     cursor: pointer;
     user-select: none;
@@ -110,3 +130,124 @@ table th, table td {
 }
 table th { background: #2a2a2a; color: #aaa; font-weight: 500; }
 table tr:hover { background: #2a2a2a; }
+
+.sev-badge {
+    display: inline-block; padding: 0.1rem 0.5rem; border-radius: 4px;
+    font-size: 0.75rem; font-weight: bold; color: white;
+}
+.status-badge {
+    display: inline-block; padding: 0.1rem 0.5rem; border-radius: 4px;
+    font-size: 0.75rem; font-weight: bold; color: white;
+}
+.status-badge.active { background: #28a745; }
+.status-badge.done   { background: #6c757d; }
+
+.frozen-badge {
+    color: #ff8a65; font-weight: bold; font-size: 0.75rem;
+    background: #3a1e10; padding: 0.1rem 0.4rem; border-radius: 4px;
+}
+.hold-badge {
+    color: #ffd54f; font-size: 0.75rem;
+    background: #332a10; padding: 0.1rem 0.4rem; border-radius: 4px;
+}
+
+/* Бирки прогресса/брака в таблице партий (очередь/измерение). */
+.tag-badge {
+    display: inline-block; padding: 0.1rem 0.45rem; border-radius: 4px;
+    font-size: 0.72rem; font-weight: bold; color: #4fc3f7;
+    background: #15303a; letter-spacing: 0.02em;
+}
+.tag-muted { color: #666; }
+
+/* ─── Панель измерительных станков (M-GMM) ──────────────────── */
+.inspection-stations {
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+    gap: 0.6rem;
+}
+.inspection-cell {
+    background: #2a2a2a; padding: 0.6rem 0.8rem; border-radius: 4px;
+    border-left: 4px solid #4fc3f7;
+}
+.inspection-cell.is-idle { border-left-color: #555; opacity: 0.6; }
+.insp-id { font-weight: bold; }
+.insp-mode {
+    font-size: 0.7rem; font-weight: bold; color: #15303a; background: #4fc3f7;
+    padding: 0.05rem 0.4rem; border-radius: 3px; margin-left: 0.3rem;
+}
+.insp-batch { font-family: monospace; font-size: 0.82rem; color: #ccc; margin-top: 0.25rem; }
+.insp-stage { font-size: 0.78rem; color: #999; }
+.insp-progress { font-size: 0.82rem; color: #e0e0e0; margin: 0.3rem 0 0.25rem; }
+.insp-idle { color: #888; font-size: 0.85rem; margin-top: 0.3rem; }
+.insp-bar { height: 6px; background: #1e1e1e; border-radius: 3px; overflow: hidden; }
+.insp-bar-fill { height: 100%; background: #4fc3f7; transition: width 0.3s; }
+
+/* ─── Модалка сценария ──────────────────────────────────────── */
+.modal {
+    position: fixed; inset: 0; background: rgba(0,0,0,0.65);
+    display: flex; align-items: center; justify-content: center;
+    z-index: 100;
+}
+.modal.hidden { display: none; }
+.modal-card {
+    background: #2a2a2a; padding: 0; border-radius: 6px;
+    min-width: 380px; max-width: 480px;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.5);
+    border: 1px solid #444;
+}
+.modal-header {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 0.8rem 1.2rem;
+    border-bottom: 1px solid #444;
+}
+.modal-header h3 { margin: 0; font-size: 1.05rem; }
+.modal-close {
+    background: none; border: none; color: #999; cursor: pointer;
+    font-size: 1.1rem;
+}
+.modal-close:hover { color: #fff; }
+.modal-body { padding: 1.2rem; }
+.form-row {
+    display: flex; align-items: center;
+    margin-bottom: 0.8rem;
+}
+.form-row label {
+    width: 130px; color: #aaa; font-size: 0.85rem;
+}
+.form-row select, .form-row input {
+    flex: 1; padding: 0.4rem 0.6rem;
+    background: #1e1e1e; color: #e0e0e0;
+    border: 1px solid #555; border-radius: 4px;
+    font-family: inherit; font-size: 0.85rem;
+}
+.form-value {
+    flex: 1; font-family: monospace; color: #4fc3f7;
+}
+.form-actions { justify-content: flex-end; gap: 0.5rem; margin-top: 0.5rem; }
+.form-actions .btn { margin-left: 0.4rem; }
+.modal-msg { margin-top: 0.6rem; font-size: 0.85rem; min-height: 1.2em; }
+.modal-msg.ok { color: #28a745; }
+.modal-msg.error { color: #dc3545; }
+
+/* ─── Таблица сценариев ─────────────────────────────────────── */
+.scenarios-table tr { background: #221a14; }
+.scenarios-table tr:hover { background: #2c241c; }
+
+.auto-toggle {
+    margin-left: 0.8rem;
+    font-size: 0.8rem;
+    font-weight: normal;
+    color: #ccc;
+    cursor: pointer;
+    user-select: none;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+    vertical-align: middle;
+}
+.auto-toggle input { vertical-align: middle; }
+.auto-toggle .auto-next {
+    color: #888;
+    font-size: 0.72rem;
+    font-style: italic;
+    margin-left: 0.35rem;
+}
