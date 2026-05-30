@@ -1,0 +1,118 @@
+{
+  "annotations": {"list": [{"builtIn": 1, "datasource": {"type": "grafana", "uid": "-- Grafana --"}, "enable": true, "hide": true, "iconColor": "rgba(0, 211, 255, 1)", "name": "Annotations & Alerts", "type": "dashboard"}]},
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "tags": ["ml", "vkr"],
+  "templating": {
+    "list": [
+      {
+        "name": "machine",
+        "label": "Станок",
+        "type": "query",
+        "datasource": {"type": "grafana-postgresql-datasource", "uid": "PCC52D03280B7034C"},
+        "definition": "SELECT DISTINCT machine_id FROM ml_forecasts ORDER BY 1",
+        "query": "SELECT DISTINCT machine_id FROM ml_forecasts ORDER BY 1",
+        "refresh": 2,
+        "includeAll": false,
+        "multi": false,
+        "current": {}
+      },
+      {
+        "name": "sensor",
+        "label": "Сенсор",
+        "type": "query",
+        "datasource": {"type": "grafana-postgresql-datasource", "uid": "PCC52D03280B7034C"},
+        "definition": "SELECT DISTINCT sensor FROM ml_forecasts WHERE machine_id = '$machine' ORDER BY 1",
+        "query": "SELECT DISTINCT sensor FROM ml_forecasts WHERE machine_id = '$machine' ORDER BY 1",
+        "refresh": 2,
+        "includeAll": false,
+        "multi": false,
+        "current": {}
+      }
+    ]
+  },
+  "time": {"from": "2026-01-01T00:00:00.000Z", "to": "2027-01-01T00:00:00.000Z"},
+  "timepicker": {},
+  "timezone": "",
+  "title": "ML — Аномалии и прогнозы",
+  "uid": "ml-anomalies-forecasts",
+  "version": 1,
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Аномалий в последнем прогоне",
+      "datasource": {"type": "grafana-postgresql-datasource", "uid": "PCC52D03280B7034C"},
+      "gridPos": {"h": 4, "w": 6, "x": 0, "y": 0},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "colorMode": "value", "graphMode": "none"},
+      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "thresholds": {"steps": [{"color": "green", "value": null}, {"color": "red", "value": 1}]}}, "overrides": []},
+      "targets": [{"refId": "A", "datasource": {"type": "grafana-postgresql-datasource", "uid": "PCC52D03280B7034C"}, "format": "table", "editorMode": "code", "rawQuery": true, "rawSql": "SELECT n_anomalies FROM ml_runs WHERE kind = 'run' ORDER BY run_id DESC LIMIT 1"}]
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Всего аномальных точек",
+      "datasource": {"type": "grafana-postgresql-datasource", "uid": "PCC52D03280B7034C"},
+      "gridPos": {"h": 4, "w": 6, "x": 6, "y": 0},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "colorMode": "value", "graphMode": "none"},
+      "fieldConfig": {"defaults": {"color": {"mode": "fixed", "fixedColor": "orange"}}, "overrides": []},
+      "targets": [{"refId": "A", "datasource": {"type": "grafana-postgresql-datasource", "uid": "PCC52D03280B7034C"}, "format": "table", "editorMode": "code", "rawQuery": true, "rawSql": "SELECT count(*) FROM ml_anomalies WHERE is_anomaly"}]
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Нарушений интервала прогноза",
+      "datasource": {"type": "grafana-postgresql-datasource", "uid": "PCC52D03280B7034C"},
+      "gridPos": {"h": 4, "w": 6, "x": 12, "y": 0},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "colorMode": "value", "graphMode": "none"},
+      "fieldConfig": {"defaults": {"color": {"mode": "fixed", "fixedColor": "purple"}}, "overrides": []},
+      "targets": [{"refId": "A", "datasource": {"type": "grafana-postgresql-datasource", "uid": "PCC52D03280B7034C"}, "format": "table", "editorMode": "code", "rawQuery": true, "rawSql": "SELECT count(*) FROM ml_forecasts WHERE breach"}]
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Обучено станков (посл. train)",
+      "datasource": {"type": "grafana-postgresql-datasource", "uid": "PCC52D03280B7034C"},
+      "gridPos": {"h": 4, "w": 6, "x": 18, "y": 0},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "colorMode": "value", "graphMode": "none"},
+      "fieldConfig": {"defaults": {"color": {"mode": "fixed", "fixedColor": "blue"}}, "overrides": []},
+      "targets": [{"refId": "A", "datasource": {"type": "grafana-postgresql-datasource", "uid": "PCC52D03280B7034C"}, "format": "table", "editorMode": "code", "rawQuery": true, "rawSql": "SELECT n_machines FROM ml_runs WHERE kind = 'train' ORDER BY run_id DESC LIMIT 1"}]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Anomaly score (ECOD) по станкам — последний прогон",
+      "datasource": {"type": "grafana-postgresql-datasource", "uid": "PCC52D03280B7034C"},
+      "gridPos": {"h": 9, "w": 24, "x": 0, "y": 4},
+      "fieldConfig": {"defaults": {"custom": {"drawStyle": "line", "lineWidth": 1, "fillOpacity": 5, "showPoints": "never"}, "color": {"mode": "palette-classic"}}, "overrides": []},
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
+      "targets": [{"refId": "A", "datasource": {"type": "grafana-postgresql-datasource", "uid": "PCC52D03280B7034C"}, "format": "time_series", "editorMode": "code", "rawQuery": true, "rawSql": "SELECT event_time AS \"time\", machine_id AS metric, score_ecod AS value FROM ml_anomalies WHERE run_id = (SELECT max(run_id) FROM ml_runs WHERE kind = 'run') ORDER BY event_time"}]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Прогноз Prophet: $machine / $sensor (yhat + интервал 99% + факт)",
+      "datasource": {"type": "grafana-postgresql-datasource", "uid": "PCC52D03280B7034C"},
+      "gridPos": {"h": 10, "w": 24, "x": 0, "y": 13},
+      "fieldConfig": {"defaults": {"custom": {"drawStyle": "line", "lineWidth": 1, "fillOpacity": 0, "showPoints": "never"}, "color": {"mode": "palette-classic"}}, "overrides": [{"matcher": {"id": "byName", "options": "actual"}, "properties": [{"id": "custom.lineWidth", "value": 2}, {"id": "color", "value": {"mode": "fixed", "fixedColor": "yellow"}}]}, {"matcher": {"id": "byName", "options": "yhat"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "green"}}]}, {"matcher": {"id": "byRegexp", "options": "/lower|upper/"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "rgba(120,120,120,0.6)"}}, {"id": "custom.fillOpacity", "value": 10}]}]},
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
+      "targets": [{"refId": "A", "datasource": {"type": "grafana-postgresql-datasource", "uid": "PCC52D03280B7034C"}, "format": "time_series", "editorMode": "code", "rawQuery": true, "rawSql": "SELECT ts AS \"time\", yhat AS \"yhat\", yhat_lower AS \"lower\", yhat_upper AS \"upper\", actual AS \"actual\" FROM ml_forecasts WHERE machine_id = '$machine' AND sensor = '$sensor' AND run_id = (SELECT max(run_id) FROM ml_forecasts WHERE machine_id = '$machine' AND sensor = '$sensor') ORDER BY ts"}]
+    },
+    {
+      "id": 7,
+      "type": "table",
+      "title": "Последние аномалии (is_anomaly)",
+      "datasource": {"type": "grafana-postgresql-datasource", "uid": "PCC52D03280B7034C"},
+      "gridPos": {"h": 10, "w": 24, "x": 0, "y": 23},
+      "options": {"showHeader": true},
+      "fieldConfig": {"defaults": {}, "overrides": []},
+      "targets": [{"refId": "A", "datasource": {"type": "grafana-postgresql-datasource", "uid": "PCC52D03280B7034C"}, "format": "table", "editorMode": "code", "rawQuery": true, "rawSql": "SELECT event_time, machine_id, top_sensor, top_sensor_z, round(score_ecod::numeric, 3) AS score_ecod, round(score_iforest::numeric, 3) AS score_iforest FROM ml_anomalies WHERE is_anomaly ORDER BY id DESC LIMIT 200"}]
+    }
+  ]
+}

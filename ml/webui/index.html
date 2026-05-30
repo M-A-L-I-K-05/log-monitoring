@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ML-сервис — мониторинг логов</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+    <div>
+        <h1>ML-сервис</h1>
+        <div class="sub">детекция аномалий (ECOD + IsolationForest) и прогноз (Prophet)</div>
+    </div>
+    <div class="status-line">
+        <span id="loki-badge" class="badge off">Loki…</span>
+        <span id="version-badge" class="badge info">версия: —</span>
+        <span id="bg-badge" class="badge off">фон: —</span>
+        <span class="muted" id="run-count">прогонов: 0</span>
+    </div>
+</header>
+
+<main>
+    <!-- ── Обучение ─────────────────────────────────────── -->
+    <section>
+        <h2>Обучение модели <span class="counters">фит на чистом baseline → сохраняется как версия весов на диск</span></h2>
+        <p class="hint">Прогоните завод в нормальном режиме (без сценариев), затем обучите.
+            Веса замораживаются и переиспользуются — пересчёт при каждом прогоне не нужен.</p>
+        <div class="card">
+            <div class="row">
+                <div class="field">
+                    <label for="t-lookback">Окно данных (реальные минуты)</label>
+                    <input id="t-lookback" type="number" step="1" placeholder="по умолчанию (30)">
+                </div>
+                <div class="field">
+                    <label for="t-contam">Contamination (доля аномалий)</label>
+                    <input id="t-contam" type="number" step="0.005" placeholder="0.02">
+                </div>
+                <div class="field">
+                    <label for="t-tag">Метка версии</label>
+                    <input id="t-tag" type="text" placeholder="например baseline-month">
+                </div>
+                <div class="field">
+                    <label>&nbsp;</label>
+                    <button id="btn-train" class="btn btn-green">Обучить и сохранить</button>
+                </div>
+            </div>
+            <div id="train-result" hidden></div>
+        </div>
+    </section>
+
+    <!-- ── Версии весов ─────────────────────────────────── -->
+    <section>
+        <h2>Сохранённые версии весов <span class="counters" id="versions-count"></span></h2>
+        <p class="hint">«Подключить» — загрузить версию в память и сделать активной для скоринга.</p>
+        <div class="card">
+            <table>
+                <thead><tr>
+                    <th>Версия</th><th>Метка</th><th>Создана</th>
+                    <th>Станков</th><th>Активна</th><th></th>
+                </tr></thead>
+                <tbody id="versions-tbody"></tbody>
+            </table>
+            <div id="versions-empty" class="empty" hidden>Версий пока нет — обучите модель.</div>
+        </div>
+    </section>
+
+    <!-- ── Станки активной версии ───────────────────────── -->
+    <section>
+        <h2>Станки активной версии <span class="counters" id="machines-count"></span></h2>
+        <div class="card">
+            <table>
+                <thead><tr>
+                    <th>Станок</th><th>Тип</th><th>Обучено точек</th>
+                    <th>Contamination</th><th>Сенсоры</th><th>Обучено (UTC)</th>
+                </tr></thead>
+                <tbody id="machines-tbody"></tbody>
+            </table>
+            <div id="machines-empty" class="empty" hidden>Активная модель не загружена.</div>
+        </div>
+    </section>
+
+    <!-- ── Скоринг и режим ──────────────────────────────── -->
+    <section>
+        <h2>Скоринг и режим</h2>
+        <div class="card">
+            <div class="controls-inline" style="margin-bottom:0.7rem;">
+                <button id="btn-detect" class="btn btn-blue">Детекция (run-once)</button>
+                <button id="btn-forecast" class="btn btn-blue">Детекция + прогноз</button>
+                <button id="btn-evaluate" class="btn btn-gray">Оценка качества</button>
+                <button id="btn-reset" class="btn btn-red">Сбросить результаты</button>
+            </div>
+            <div class="controls-inline">
+                <label class="toggle"><input type="checkbox" id="bg-enabled"> Фоновый поток</label>
+                <label class="toggle"><input type="checkbox" id="bg-retrain"> Авто-переобучение</label>
+                <span class="field" style="flex-direction:row; gap:0.4rem; align-items:center;">
+                    <label style="font-size:0.78rem;">интервал, с</label>
+                    <input id="bg-interval" type="number" step="10" style="min-width:90px;">
+                </span>
+                <button id="btn-loop" class="btn btn-tiny btn-gray">Применить режим</button>
+            </div>
+            <div id="run-result" hidden></div>
+            <div id="eval-result" hidden></div>
+        </div>
+    </section>
+</main>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

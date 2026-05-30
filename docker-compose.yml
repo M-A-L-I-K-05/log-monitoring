@@ -115,6 +115,29 @@ services:
       logging: "promtail"
     restart: unless-stopped
 
+  ml:
+    build: ./ml
+    container_name: ml
+    ports:
+      - "8006:8006"
+    environment:
+      PYTHONUNBUFFERED: 1
+      DATABASE_URL: postgresql://admin:secret@postgres:5432/factory
+      LOKI_URL: http://loki:3100
+      ML_MODELS_DIR: /app/models
+    volumes:
+      - ./ml:/app
+      - ml-models:/app/models          # веса детекторов (named volume, переживают пересборку)
+    command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8006", "--reload"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      loki:
+        condition: service_started
+    labels:
+      logging: "promtail"
+    restart: unless-stopped
+
   loki:
     image: grafana/loki:3.0.0
     container_name: loki
@@ -160,3 +183,4 @@ volumes:
   postgres-data:
   loki-data:
   grafana-data:
+  ml-models:
