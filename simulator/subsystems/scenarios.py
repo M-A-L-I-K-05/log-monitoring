@@ -1,16 +1,16 @@
 """ScenariosController: управление сценариями аномалий по реестру config.
 
-Логика:
-- При старте сценария: проверяем тип станка → ищем сценарий в реестре
-  config.SCENARIOS_BY_MACHINE_TYPE[machine_type][scenario_type].
-- Применяем sensor-модификаторы (масштабируем по severity вокруг 1.0).
-- Сохраняем мета (включая measurements/severity/parts_limit) в state.scenarios_registry
-  (читается equipment и quality).
-- Лимит в деталях. Если parts_limit > остатка деталей в текущей партии —
-  обрезается до остатка (сценарий не «доживает» до следующей партии).
-- Самозавершение — equipment._auto_complete_scenario, который создаёт
-  pending_scenario_wo. ScenariosController.tick() удаляет неактуальные
-  сценарии (status=auto_completed) и снимает модификаторы.
+Режимы (config.SCENARIOS_BY_MACHINE_TYPE[type][name]["mode"]):
+- gradual: медленный дрейф; drift_progress накапливается по деталям в
+  equipment._tick_running_processing. Фаза 1 (0 → scrap_threshold): сенсоры
+  ползут, брака нет, пересекает границы партий. Фаза 2 (scrap → stop):
+  детали тегаются; сценарий завершается по stop_threshold ИЛИ концу партии.
+- step: полная аномалия с первой детали; завершается по parts_cap (из конфига
+  по severity ± jitter).
+
+Самозавершение — equipment._auto_complete_scenario: alarm → WO (pending_scenario_wos)
+→ станок idle. ScenariosController.tick() снимает модификаторы (_cleanup_scenario),
+сбрасывает drift_progress.
 """
 import logging
 import random
@@ -37,7 +37,7 @@ class ScenariosController:
 
     def reset(self) -> None:
         """Сброс при /restart симулятора."""
-        # снять все модификаторы со станков
+        # снять все модификаторы и drift_progress со станков
         for sid, meta in list(self.active.items()):
             mid = meta.get("machine_id")
             if mid:
@@ -46,6 +46,10 @@ class ScenariosController:
                     for key in meta.get("sensors", {}):
                         machine.anomaly_modifier.pop(key, None)
                     machine.active_scenario_id = None
+                    machine.drift_progress = 0.0
+        # сброс drift_progress на всех станках (на случай если сценарий не в active)
+        for machine in self.state.machines.values():
+            machine.drift_progress = 0.0
         self.active.clear()
         self.state.scenarios_registry.clear()
         self._seq = 0
@@ -161,17 +165,55 @@ class ScenariosController:
                 f"machine {machine_id} already has active scenario {machine.active_scenario_id}"
             )
 
-        # Лимит — обрезка по остатку, если возможно вычислить.
-        parts_limit_effective = self._effective_limit(machine, parts_limit)
-
-        # sensor-множители: вокруг 1.0, масштабируем по severity.
         sev = config.SEVERITY_LEVELS[severity]
         sensor_scale = sev["sensor_scale"]
+
+        mode = spec.get("mode", "step")
+        is_furnace = (machine.machine_type == "furnace")
+
+        # Целевые множители:
+        # gradual (печь и не-печь): target напрямую из конфига — откалиброван
+        #   по 3σ (при drift=scrap_threshold значение сенсора = mean ± 3σ).
+        #   sensor_scale НЕ применяется: severity влияет только на темп дрейфа
+        #   (для печи — на число загрузок до отбраковки, см. furnace.py).
+        # step: масштабируем sensor_scale по severity.
         sensors_final: dict[str, float] = {}
         for k, mult in spec["sensors"].items():
-            scaled = 1.0 + (mult - 1.0) * sensor_scale
-            sensors_final[k] = scaled
-            machine.anomaly_modifier[k] = scaled
+            if mode == "gradual":
+                sensors_final[k] = mult
+            else:
+                sensors_final[k] = 1.0 + (mult - 1.0) * sensor_scale
+
+        if mode == "gradual":
+            # Дрейф начинается с 0 — anomaly_modifier пока не действует.
+            # Для печи дрейф растёт по времени в carburizing (furnace.py),
+            # pace в деталях не используется.
+            machine.drift_progress = 0.0
+            for k in sensors_final:
+                machine.anomaly_modifier[k] = 1.0
+            scrap_threshold = config.DRIFT_SCRAP_THRESHOLD
+            stop_threshold = config.DRIFT_STOP_THRESHOLD
+            pace = None if is_furnace else config.DRIFT_PACE_BY_SEVERITY[severity]
+            parts_cap = None
+        else:
+            # step: аномалия полная с первой детали / с первого тика.
+            # Для печи модификатор включается phase-lock'ом только в quenching
+            # (furnace.py), завершение управляется временем, а не parts_cap.
+            machine.drift_progress = 1.0
+            for k, v in sensors_final.items():
+                machine.anomaly_modifier[k] = v
+            scrap_threshold = 0.0
+            stop_threshold = None
+            pace = None
+            if is_furnace:
+                parts_cap = None
+            else:
+                jitter = random.randint(-config.STEP_PARTS_CAP_JITTER,
+                                        config.STEP_PARTS_CAP_JITTER)
+                parts_cap = config.STEP_PARTS_CAP.get(severity, 10) + jitter
+
+        # parts_limit_effective — для совместимости с API и scenario_event-логом.
+        parts_limit_effective = self._effective_limit(machine, parts_limit, mode, parts_cap)
 
         sid = self._next_id()
         meta = {
@@ -180,12 +222,18 @@ class ScenariosController:
             "machine_type": machine.machine_type,
             "scenario_type": scenario_type,
             "severity": severity,
-            "parts_limit": parts_limit,
-            "parts_limit_effective": parts_limit_effective,
-            "sensors": sensors_final,
+            "mode": mode,
+            "sensors_final": sensors_final,
+            "sensors": sensors_final,          # backward compat (_cleanup_scenario)
             "measurements": dict(spec.get("measurements", {})),
             "wo_duration_min": spec.get("wo_duration_min", 30.0),
-            "trigger_phase": spec.get("trigger_phase"),  # для печных сценариев
+            "trigger_phase": spec.get("trigger_phase"),
+            "scrap_threshold": scrap_threshold,
+            "stop_threshold": stop_threshold,
+            "pace": pace,
+            "parts_cap": parts_cap,
+            "parts_limit": parts_limit,
+            "parts_limit_effective": parts_limit_effective,
             "started_at": self.state.virtual_time,
             "status": "active",
         }
@@ -193,9 +241,9 @@ class ScenariosController:
         self.state.scenarios_registry[sid] = meta
         machine.active_scenario_id = sid
 
-        logger.info("started scenario %s on %s (%s, severity=%s, limit=%d→%d)",
-                    sid, machine_id, scenario_type, severity, parts_limit,
-                    parts_limit_effective)
+        logger.info("started scenario %s on %s (%s, mode=%s, sev=%s, cap=%s)",
+                    sid, machine_id, scenario_type, mode, severity,
+                    parts_cap if parts_cap is not None else "gradual")
         if self.client is not None:
             self.client.scenario_event(
                 event="start",
@@ -205,9 +253,13 @@ class ScenariosController:
                 severity=severity,
                 parts_limit=parts_limit_effective,
                 event_time=self.state.virtual_time,
-                details={"sensors": sensors_final,
+                details={"mode": mode,
+                         "sensors": sensors_final,
                          "measurements": meta["measurements"],
-                         "wo_duration_min": meta["wo_duration_min"]},
+                         "wo_duration_min": meta["wo_duration_min"],
+                         "scrap_threshold": scrap_threshold,
+                         "stop_threshold": stop_threshold,
+                         "parts_cap": parts_cap},
             )
         return sid
 
@@ -242,48 +294,109 @@ class ScenariosController:
             if m.get("status") not in ("active", "auto_completed"):
                 continue
             machine = self.state.machines.get(m.get("machine_id"))
-            processed = 0
-            remaining = m.get("parts_limit_effective", m.get("parts_limit"))
-            if machine and machine.current_batch_id:
-                batch = self.state.batches.get(machine.current_batch_id)
-                if batch:
-                    processed = sum(1 for s in batch.scenario_marked_indices.values()
-                                    if s == sid)
-                    remaining = max(0, m.get("parts_limit_effective",
-                                             m.get("parts_limit", 0)) - processed)
+            mode = m.get("mode", "step")
+            machine_type = m.get("machine_type")
+            is_furnace = machine_type == "furnace"
+            processed = self._count_tagged(machine, sid)
+            drift_p = round(machine.drift_progress, 4) if machine else None
+
+            # Для печи step «прогресс» — по времени фазы (см. furnace.py),
+            # а не по деталям. Считаем прошедшее время в trigger-фазе и фазу.
+            elapsed_min = None
+            threshold_min = None
+            furnace_phase = None
+            if is_furnace and mode == "step":
+                threshold_min = config.FURNACE_STEP_CATCH_MIN
+                elapsed_min, furnace_phase = self._furnace_step_progress(m)
+
+            # Для step (не печь): показываем оставшийся cap; для gradual — дрейф.
+            if mode == "step" and not is_furnace:
+                cap = m.get("parts_cap", m.get("parts_limit_effective", m.get("parts_limit")))
+                parts_remaining = max(0, cap - processed) if cap else None
+            else:
+                parts_remaining = None
             result.append({
                 "id": sid,
                 "machine_id": m.get("machine_id"),
+                "machine_type": machine_type,
                 "scenario_type": m.get("scenario_type"),
                 "severity": m.get("severity"),
-                "parts_limit": m.get("parts_limit_effective", m.get("parts_limit")),
-                "parts_processed": processed,
-                "parts_remaining": remaining,
+                "mode": mode,
+                "drift_progress": drift_p,
+                "scrap_threshold": m.get("scrap_threshold"),
+                "stop_threshold": m.get("stop_threshold"),
+                "parts_cap": m.get("parts_cap"),
+                "parts_tagged": processed,
+                "parts_remaining": parts_remaining,
+                "elapsed_min": elapsed_min,
+                "threshold_min": threshold_min,
+                "furnace_phase": furnace_phase,
                 "status": m.get("status"),
                 "started_at": m.get("started_at").isoformat() if m.get("started_at") else None,
             })
         return result
+
+    def _count_tagged(self, machine, sid: str) -> int:
+        """Сколько деталей помечено данным сценарием.
+
+        Обычный станок — по текущей партии; печь — по всем партиям загрузки.
+        """
+        if machine is None:
+            return 0
+        if machine.machine_type == "furnace":
+            load = self.state.furnace_loads.get(machine.machine_id)
+            batch_ids = load.batch_ids if load else \
+                self.state.frozen_furnace_batches.get(machine.machine_id, [])
+            total = 0
+            for bid in batch_ids:
+                b = self.state.batches.get(bid)
+                if b:
+                    total += sum(1 for s in b.scenario_marked_indices.values() if s == sid)
+            return total
+        if machine.current_batch_id:
+            batch = self.state.batches.get(machine.current_batch_id)
+            if batch:
+                return sum(1 for s in batch.scenario_marked_indices.values() if s == sid)
+        return 0
+
+    def _furnace_step_progress(self, meta: dict) -> tuple[float, str]:
+        """(прошедшие минуты в trigger-фазе, фаза normal|scrap) для печного step."""
+        machine = self.state.machines.get(meta.get("machine_id"))
+        load = self.state.furnace_loads.get(meta.get("machine_id")) if machine else None
+        trigger = meta.get("trigger_phase")
+        if load is None or trigger is None or load.phase != trigger \
+                or load.phase_started_at is None:
+            # ещё не вошли в trigger-фазу (или уже вышли) → 0 мин, normal
+            return 0.0, "normal"
+        elapsed = (self.state.virtual_time - load.phase_started_at).total_seconds() / 60.0
+        elapsed = max(0.0, round(elapsed, 1))
+        phase = "scrap" if elapsed >= config.FURNACE_STEP_CATCH_MIN else "normal"
+        return elapsed, phase
 
     # ─── вспомогательное ────────────────────────────────────
     def _next_id(self) -> str:
         self._seq += 1
         return f"SC-{self._seq:04d}"
 
-    def _effective_limit(self, machine, parts_limit: int) -> int:
-        """Обрезаем parts_limit до остатка текущей партии на станке (если есть)."""
+    def _effective_limit(self, machine, parts_limit: int,
+                         mode: str = "step", parts_cap: int | None = None) -> int:
+        """Информационный лимит для scenario_event-лога и list_active().
+
+        gradual: не привязываем к одной партии (фаза 1 пересекает границы).
+                 Возвращаем 0 как маркер «не применимо» — реальная остановка
+                 управляется stop_threshold / концом партии в фазе 2.
+        step:    возвращаем parts_cap (уже посчитан с jitter).
+        furnace: возвращаем исходный parts_limit (batch-ориентированный).
+        """
         if machine.machine_type == "furnace":
-            return parts_limit  # печь обрабатывает всё одной загрузкой
-        bid = machine.current_batch_id
-        if not bid:
             return parts_limit
-        batch = self.state.batches.get(bid)
-        if not batch:
-            return parts_limit
-        remaining = batch.effective_quantity - machine.parts_done_in_batch
-        return max(1, min(parts_limit, remaining))
+        if mode == "gradual":
+            return 0   # нет фиксированного лимита в деталях
+        # step
+        return parts_cap if parts_cap is not None else parts_limit
 
     def _cleanup_scenario(self, scenario_id: str, now: datetime) -> None:
-        """Снятие sensor-модификаторов со станка после auto_completed/stopped.
+        """Снятие sensor-модификаторов и сброс drift_progress после auto_completed/stopped.
 
         ВАЖНО: сам объект сценария НЕ удаляется из state.scenarios_registry —
         партии с помеченными деталями могут дойти до M-GMM ПОЗЖЕ окончания
@@ -305,13 +418,17 @@ class ScenariosController:
                     machine.anomaly_modifier.pop(key, None)
                 if machine.active_scenario_id == scenario_id:
                     machine.active_scenario_id = None
+                machine.drift_progress = 0.0
         # Помечаем сценарий как cleaned, чтобы tick больше не трогал его.
         meta["cleaned"] = True
 
     # ─── списки доступных сценариев для UI ──────────────────
     def catalog(self) -> dict:
-        """Описание реестра для UI: machine_type → [scenario_type, ...]."""
+        """Описание реестра для UI: machine_type → [{type, mode}, ...]."""
         return {
-            mt: list(scenarios.keys())
+            mt: [
+                {"type": name, "mode": spec.get("mode", "step")}
+                for name, spec in scenarios.items()
+            ]
             for mt, scenarios in config.SCENARIOS_BY_MACHINE_TYPE.items()
         }

@@ -152,7 +152,7 @@ class Alarm(BaseModel):
     alarm_code: str
     severity: str
     message: str
-    details: dict[str, str | int | float] | None = None
+    details: dict | None = None
     event_time: datetime
 
 

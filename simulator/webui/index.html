@@ -23,6 +23,7 @@
             <button class="btn btn-speed" data-speed="1">×1</button>
             <button class="btn btn-speed" data-speed="10">×10</button>
             <button class="btn btn-speed" data-speed="100">×100</button>
+            <button class="btn btn-speed" data-speed="300">×300</button>
             <button class="btn btn-speed" data-speed="1000">×1000</button>
             <span class="separator">|</span>
             <button id="btn-sync-fleet" class="btn btn-gray" title="Sync machine fleet from config">Sync Fleet</button>
@@ -44,26 +45,50 @@
 
         <section>
             <h2>Активные сценарии <span id="scenarios-count">(0)</span>
-                <button id="btn-stop-all-sc" class="btn btn-red btn-tiny">Стоп всё</button>
+                <button id="btn-stop-all-sc" class="btn btn-red btn-tiny">Stop All</button>
                 <label class="auto-toggle">
                     <input type="checkbox" id="chk-auto-scenarios">
                     Auto Scenarios
                 </label>
             </h2>
-            <table class="scenarios-table">
-                <thead>
-                    <tr>
-                        <th>ID</th>
-                        <th>Станок</th>
-                        <th>Сценарий</th>
-                        <th>Тяжесть</th>
-                        <th>Деталей до WO</th>
-                        <th>Статус</th>
-                        <th></th>
-                    </tr>
-                </thead>
-                <tbody id="scenarios-body"></tbody>
-            </table>
+
+            <div class="sc-sub">
+                <h3 class="sc-subheader">Gradual</h3>
+                <table class="scenarios-table">
+                    <thead>
+                        <tr>
+                            <th>ID</th>
+                            <th>Machine</th>
+                            <th>Type</th>
+                            <th>Severity</th>
+                            <th>Drift</th>
+                            <th>Phase</th>
+                            <th>Defective parts</th>
+                            <th></th>
+                        </tr>
+                    </thead>
+                    <tbody id="scenarios-gradual-body"></tbody>
+                </table>
+            </div>
+
+            <div class="sc-sub">
+                <h3 class="sc-subheader">Step</h3>
+                <table class="scenarios-table">
+                    <thead>
+                        <tr>
+                            <th>ID</th>
+                            <th>Machine</th>
+                            <th>Type</th>
+                            <th>Severity</th>
+                            <th>Phase</th>
+                            <th>Processed</th>
+                            <th>Remaining</th>
+                            <th></th>
+                        </tr>
+                    </thead>
+                    <tbody id="scenarios-step-body"></tbody>
+                </table>
+            </div>
         </section>
 
         <section>
@@ -74,6 +99,11 @@
         <section>
             <h2>Загрузки печей</h2>
             <div class="furnace-loads" id="furnace-loads"></div>
+        </section>
+
+        <section>
+            <h2>Очередь перед измерением <span id="queue-measurement-count">(0)</span></h2>
+            <div class="queue-list" id="queue-measurement"></div>
         </section>
 
         <section>
@@ -135,6 +165,9 @@
                     <label for="modal-scenario-type">Сценарий</label>
                     <select id="modal-scenario-type"></select>
                 </div>
+                <div class="sc-mode-row">
+                    <div id="modal-sc-mode-hint" class="sc-mode-hint"></div>
+                </div>
                 <div class="form-row">
                     <label for="modal-severity">Тяжесть</label>
                     <select id="modal-severity">
@@ -142,10 +175,6 @@
                         <option value="clear" selected>clear</option>
                         <option value="gross">gross</option>
                     </select>
-                </div>
-                <div class="form-row">
-                    <label for="modal-parts-limit">Лимит деталей</label>
-                    <input id="modal-parts-limit" type="number" min="1" value="30">
                 </div>
                 <div class="form-row form-actions">
                     <button id="modal-submit" class="btn btn-green">Старт</button>

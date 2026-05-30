@@ -23,9 +23,8 @@ class Batch:
     # и измерением: после стадии X partия идёт на M-GMM с last_processed_stage=X).
     last_processed_stage: str | None = None
     # Станок, на котором партия проходила last_processed_stage.
-    # Нужен quality для:
-    #   а) корректного source_machine_id в БД для scenario-fail измерений,
-    #   б) проверки флага verify_next_batch_with_sample на этом станке (Case B).
+    # Нужен quality для корректного source_machine_id в БД для scenario-fail
+    # измерений.
     last_processed_machine_id: str | None = None
 
     # Партия не уходит на следующий этап, пока quality не отпустит флаг.

@@ -48,9 +48,15 @@ const STATE_COLORS = {
 };
 
 const SEVERITY_COLORS = {
-    light: "#f0ad4e",
-    clear: "#e0a800",
-    gross: "#dc3545",
+    light: "#ffc107",   // yellow
+    clear: "#fd7e14",   // orange
+    gross: "#dc3545",   // red
+};
+// Приглушённый фон для gradual фазы 1 (дрейф без брака)
+const SEVERITY_COLORS_MUTED = {
+    light: "#2a2100",
+    clear: "#2a1500",
+    gross: "#2a0505",
 };
 
 async function fetchStatus() {
@@ -75,13 +81,14 @@ async function fetchScenariosMeta() {
         if (Array.isArray(data.severity_levels) && data.severity_levels.length) {
             severityLevels = data.severity_levels;
             const sel = $("modal-severity");
-            sel.innerHTML = "";
-            for (const s of severityLevels) {
-                const opt = document.createElement("option");
-                opt.value = s;
-                opt.textContent = s;
-                if (s === "clear") opt.selected = true;
-                sel.appendChild(opt);
+            if (sel.options.length === 0) {
+                for (const s of severityLevels) {
+                    const opt = document.createElement("option");
+                    opt.value = s;
+                    opt.textContent = s;
+                    if (s === "clear") opt.selected = true;
+                    sel.appendChild(opt);
+                }
             }
         }
         // Синхронизируем галочку авто-сценариев
@@ -182,9 +189,37 @@ function render(data) {
         cell.className = "machine-cell";
         cell.style.borderLeftColor = STATE_COLORS[m.state] || "#888";
         const sc = scenarioByMachine[m.machine_id];
-        const scenarioBadge = sc
-            ? `<div class="m-scenario" style="background:${SEVERITY_COLORS[sc.severity]||'#888'}">SCN: ${sc.scenario_type} (${sc.severity}) ${sc.parts_remaining}/${sc.parts_limit}</div>`
-            : "";
+        let scenarioBadge = "";
+        if (sc) {
+            const sevColor = SEVERITY_COLORS[sc.severity] || "#888";
+            if (sc.mode === "gradual") {
+                const drift = sc.drift_progress != null ? sc.drift_progress.toFixed(2) : "?";
+                const thresh = sc.scrap_threshold != null ? sc.scrap_threshold.toFixed(2) : "0.85";
+                const inScrap = (sc.drift_progress ?? 0) >= (sc.scrap_threshold ?? 0.85);
+                if (inScrap) {
+                    const defCount = sc.parts_tagged > 0 ? ` [${sc.parts_tagged} def]` : "";
+                    scenarioBadge = `<div class="m-scenario grad-phase2" style="background:${sevColor}">⚠ ${sc.scenario_type} (${sc.severity}) ${drift}${defCount}</div>`;
+                } else {
+                    scenarioBadge = `<div class="m-scenario grad-phase1" style="background:${SEVERITY_COLORS_MUTED[sc.severity]||'#222'};border:1px solid ${sevColor}">${sc.scenario_type} (${sc.severity}) ~${drift}/${thresh}</div>`;
+                }
+            } else if (sc.machine_type === "furnace") {
+                // step для печи: прогресс по времени фазы quenching.
+                const el = Math.round(sc.elapsed_min ?? 0);
+                const thr = Math.round(sc.threshold_min ?? 0);
+                const rem = Math.max(0, thr - el);
+                const isScrap = (sc.furnace_phase || "normal") === "scrap";
+                if (isScrap) {
+                    scenarioBadge = `<div class="m-scenario grad-phase2" style="background:${sevColor}">⚠ ${sc.scenario_type} (${sc.severity}) ${el}min · scrap</div>`;
+                } else {
+                    scenarioBadge = `<div class="m-scenario grad-phase1" style="background:${SEVERITY_COLORS_MUTED[sc.severity]||'#222'};border:1px solid ${sevColor}">${sc.scenario_type} (${sc.severity}) ${el}min / ${rem}min left</div>`;
+                }
+            } else {
+                // step (обычный станок): прогресс по деталям.
+                const processed = sc.parts_tagged ?? "?";
+                const cap = sc.parts_cap ?? "?";
+                scenarioBadge = `<div class="m-scenario" style="background:${sevColor}">${sc.scenario_type} (${sc.severity}) ${processed}/${cap}</div>`;
+            }
+        }
         cell.innerHTML = `
             <div class="m-id">${m.machine_id}</div>
             <div class="m-type">${m.machine_type}</div>
@@ -194,43 +229,93 @@ function render(data) {
             ${scenarioBadge}
         `;
         if (sc) {
+            const sevColor = SEVERITY_COLORS[sc.severity] || "#888";
             cell.classList.add("has-scenario");
-            cell.style.boxShadow = `inset 0 0 0 2px ${SEVERITY_COLORS[sc.severity] || '#888'}`;
+            cell.style.outline = `2px solid ${sevColor}`;
+            cell.style.outlineOffset = "-2px";
         }
         cell.addEventListener("click", () => openScenarioModal(m));
         grid.appendChild(cell);
     }
 
-    // ─── активные сценарии — таблица ───────────────────────────
+    // ─── активные сценарии — две таблицы ──────────────────────
     $("scenarios-count").textContent = `(${activeScenarios.length})`;
-    const sb = $("scenarios-body");
-    sb.innerHTML = "";
+    const sgb = $("scenarios-gradual-body");
+    const ssb = $("scenarios-step-body");
+    sgb.innerHTML = "";
+    ssb.innerHTML = "";
+
     for (const sc of activeScenarios) {
         const tr = document.createElement("tr");
-        const remaining = sc.parts_remaining ?? "—";
-        const limit = sc.parts_limit ?? "—";
-        const statusBadge = sc.status === "active"
-            ? `<span class="status-badge active">${sc.status}</span>`
-            : `<span class="status-badge done">${sc.status}</span>`;
-        tr.innerHTML = `
-            <td>${sc.id}</td>
-            <td>${sc.machine_id}</td>
-            <td>${sc.scenario_type}</td>
-            <td><span class="sev-badge" style="background:${SEVERITY_COLORS[sc.severity]||'#888'}">${sc.severity}</span></td>
-            <td>${remaining} / ${limit}</td>
-            <td>${statusBadge}</td>
-            <td><button class="btn btn-tiny btn-red" data-stop-sc="${sc.id}">Стоп</button></td>
-        `;
-        sb.appendChild(tr);
+        const sevBadge = `<span class="sev-badge" style="background:${SEVERITY_COLORS[sc.severity]||'#888'}">${sc.severity}</span>`;
+        const stopBtn = `<button class="btn btn-tiny btn-red" data-stop-sc="${sc.id}">Stop</button>`;
+
+        if (sc.mode === "gradual") {
+            const drift = sc.drift_progress != null ? sc.drift_progress.toFixed(3) : "—";
+            const thresh = sc.scrap_threshold != null ? sc.scrap_threshold.toFixed(2) : "0.85";
+            const inScrap = (sc.drift_progress ?? 0) >= (sc.scrap_threshold ?? 0.85);
+            const phaseHtml = inScrap
+                ? `<span class="phase-scrap">⚠ scrap</span>`
+                : `<span class="phase-normal">normal</span>`;
+            const defective = sc.parts_tagged ?? 0;
+            tr.innerHTML = `
+                <td>${sc.id}</td>
+                <td>${sc.machine_id}</td>
+                <td>${sc.scenario_type}</td>
+                <td>${sevBadge}</td>
+                <td>${drift} / ${thresh}</td>
+                <td>${phaseHtml}</td>
+                <td>${defective}</td>
+                <td>${stopBtn}</td>
+            `;
+            sgb.appendChild(tr);
+        } else {
+            // Step. Печь: фаза normal/scrap + прогресс по времени (мин).
+            // Остальные станки: фазы нет (сразу scrap), прогресс по деталям.
+            let phaseHtml, processed, remaining;
+            if (sc.machine_type === "furnace") {
+                const el = Math.round(sc.elapsed_min ?? 0);
+                const thr = Math.round(sc.threshold_min ?? 0);
+                const rem = Math.max(0, thr - el);
+                const isScrap = (sc.furnace_phase || "normal") === "scrap";
+                phaseHtml = isScrap
+                    ? `<span class="phase-scrap">⚠ scrap</span>`
+                    : `<span class="phase-normal">normal</span>`;
+                processed = `${el}min`;
+                remaining = `${rem}min`;
+            } else {
+                phaseHtml = `<span class="phase-scrap">⚠ scrap</span>`;
+                processed = sc.parts_tagged ?? "—";
+                remaining = sc.parts_remaining ?? "—";
+            }
+            tr.innerHTML = `
+                <td>${sc.id}</td>
+                <td>${sc.machine_id}</td>
+                <td>${sc.scenario_type}</td>
+                <td>${sevBadge}</td>
+                <td>${phaseHtml}</td>
+                <td>${processed}</td>
+                <td>${remaining}</td>
+                <td>${stopBtn}</td>
+            `;
+            ssb.appendChild(tr);
+        }
     }
-    sb.querySelectorAll("[data-stop-sc]").forEach(b => {
-        b.onclick = () => postCmd("/scenarios/stop", {scenario_id: b.dataset.stopSc});
+    [sgb, ssb].forEach(tbody => {
+        tbody.querySelectorAll("[data-stop-sc]").forEach(b => {
+            b.onclick = () => postCmd("/scenarios/stop", {scenario_id: b.dataset.stopSc});
+        });
     });
 
     // ─── queue furnace ─────────────────────────────────────────
     const qf = data.queues.waiting_furnace || [];
     $("queue-furnace-count").textContent = `(${qf.length})`;
     $("queue-furnace").innerHTML = qf.map(b => `<span class="chip">${b.batch_id}</span>`).join("");
+
+    // ─── queue measurement (перед M-GMM) ───────────────────────
+    const qm = data.queues.queue_measurement || [];
+    $("queue-measurement-count").textContent = `(${qm.length})`;
+    $("queue-measurement").innerHTML = qm.map(b => `<span class="chip">${b.batch_id}</span>`).join("");
 
     // ─── furnace loads ─────────────────────────────────────────
     const fl = $("furnace-loads");
@@ -332,6 +417,44 @@ function render(data) {
 }
 
 // ─── модалка сценария ───────────────────────────────────────
+const MODE_HINT = {
+    gradual: { label: "gradual", desc: "Постепенный дрейф через партии — для предиктивного ML" },
+    step:    { label: "step",    desc: "Мгновенная полная аномалия — для диагностики причины" },
+};
+
+const SCENARIO_DESCRIPTIONS = {
+    tool_wear:         "Ускоренный износ резца: вибрация и нагрузка шпинделя постепенно растут → отклонение торцевого биения заготовки",
+    hob_wear:          "Износ зуборезной фрезы: нарастающая вибрация и температура подшипника → отклонения профиля и шага зуба",
+    shaver_wear:       "Износ шевинг-фрезы: рост вибрации и нагрузки → отклонения профиля и направления зуба",
+    chatter:           "Вибрационный резонанс (дребезг): резкий скачок вибрации при нарезании → отклонение профиля зуба",
+    workpiece_loose:   "Ненадёжный зажим заготовки: нестабильное вращение шпинделя → биение и отклонение направления зуба",
+    shaver_wear:       "Износ шевинг-фрезы: рост вибрации и нагрузки → отклонения профиля и направления зуба",
+    under_carburizing: "Недостаточная цементация: падение углеродного потенциала и температуры → низкая поверхностная твёрдость и недостаточная глубина слоя",
+    over_carburizing:  "Избыточная цементация: перегрев и высокий углеродный потенциал → перетвёрдость и хрупкость цементованного слоя",
+    quench_distortion: "Нарушение масляной закалки: потеря потока закалочного масла → коробление геометрии (биение, направление зуба)",
+    grinding_chatter:  "Вибрационный резонанс при шлифовании: резкий скачок вибрации → шероховатость поверхности и отклонение профиля",
+    coolant_loss:      "Потеря охладителя: резкое падение расхода СОЖ → термический ожог, шероховатость и биение",
+    grinding_burn:     "Тепловой ожог шлифованием: избыток мощности при нехватке СОЖ → снижение поверхностной твёрдости и шероховатость",
+};
+
+function updateScenarioModeHint() {
+    const sel = $("modal-scenario-type");
+    const machineType = $("modal-machine-id").dataset.machineType;
+    const types = catalog[machineType] || [];
+    const info = types.find(t => t.type === sel.value);
+    const hint = $("modal-sc-mode-hint");
+    if (!hint) return;
+    if (info) {
+        const m = MODE_HINT[info.mode] || { label: info.mode, desc: "" };
+        const desc = SCENARIO_DESCRIPTIONS[info.type] || "";
+        hint.innerHTML =
+            `<span class="mode-tag ${info.mode}">${m.label}</span>${m.desc}`
+            + (desc ? `<div class="sc-desc">${desc}</div>` : "");
+    } else {
+        hint.textContent = "";
+    }
+}
+
 function openScenarioModal(machine) {
     if (!catalog) {
         alert("Каталог сценариев ещё не загружен. Попробуйте через секунду.");
@@ -344,16 +467,19 @@ function openScenarioModal(machine) {
     }
     $("modal-machine-id").textContent = `${machine.machine_id} (${machine.machine_type})`;
     $("modal-machine-id").dataset.machineId = machine.machine_id;
+    $("modal-machine-id").dataset.machineType = machine.machine_type;
     const sel = $("modal-scenario-type");
     sel.innerHTML = "";
     for (const t of types) {
         const opt = document.createElement("option");
-        opt.value = t;
-        opt.textContent = t;
+        opt.value = t.type;
+        opt.textContent = `${t.type}  [${t.mode}]`;
+        const desc = SCENARIO_DESCRIPTIONS[t.type];
+        if (desc) opt.title = desc;
         sel.appendChild(opt);
     }
-    $("modal-parts-limit").value = 30;
     $("modal-msg").textContent = "";
+    updateScenarioModeHint();
     $("scenario-modal").classList.remove("hidden");
 }
 
@@ -365,14 +491,13 @@ async function submitScenario() {
     const machine_id = $("modal-machine-id").dataset.machineId;
     const scenario_type = $("modal-scenario-type").value;
     const severity = $("modal-severity").value;
-    const parts_limit = parseInt($("modal-parts-limit").value || "30", 10);
     const msg = $("modal-msg");
     msg.textContent = "...";
     try {
         const r = await fetch("/scenarios/start", {
             method: "POST",
             headers: {"Content-Type": "application/json"},
-            body: JSON.stringify({machine_id, scenario_type, severity, parts_limit}),
+            body: JSON.stringify({machine_id, scenario_type, severity}),
         });
         const data = await r.json();
         if (!r.ok) {
@@ -441,6 +566,7 @@ document.querySelectorAll(".batches-table th[data-sort]").forEach(th => {
 $("modal-close").onclick = closeScenarioModal;
 $("modal-cancel").onclick = closeScenarioModal;
 $("modal-submit").onclick = submitScenario;
+$("modal-scenario-type").addEventListener("change", updateScenarioModeHint);
 $("scenario-modal").addEventListener("click", (e) => {
     if (e.target === $("scenario-modal")) closeScenarioModal();
 });

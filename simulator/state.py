@@ -50,6 +50,10 @@ class SimulationState:
         self.batches: dict[str, Batch] = {}        # все активные партии
         self.work_orders: dict[str, WorkOrder] = {}
         self.furnace_loads: dict[str, FurnaceLoad] = {}  # ключ = machine_id
+        # Партии печи, замороженные после сценарного выброса и ожидающие
+        # завершения ремонта печи (после WO → queue_measurement).
+        # ключ = machine_id, значение = [batch_id, ...]
+        self.frozen_furnace_batches: dict[str, list[str]] = {}
 
         # ─── Очереди задач для подсистем ──
         # Quality: партии, ожидающие обработки после M-GMM-измерения.
@@ -141,6 +145,7 @@ class SimulationState:
             self.batches.clear()
             self.work_orders.clear()
             self.furnace_loads.clear()
+            self.frozen_furnace_batches.clear()
 
             # чистим очереди задач для подсистем
             self.pending_measurements.clear()

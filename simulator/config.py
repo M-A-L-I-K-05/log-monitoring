@@ -9,7 +9,7 @@ HTTP_TIMEOUT_SEC = 10.0
 # ─── Виртуальное время ─────────────────────────────────────────
 SIM_START_TIME = datetime(2026, 1, 1, 8, 0, 0)
 DEFAULT_SPEED = 1.0
-ALLOWED_SPEEDS = [1, 10, 100, 1000]
+ALLOWED_SPEEDS = [1, 10, 100, 300, 1000]
 
 # ─── Общие тайминги (виртуальные секунды) ──────────────────────
 SETUP_TIME_SEC = 420         # 7 минут наладки (обрабатывающие станки: смена резца/фрезы)
@@ -138,7 +138,7 @@ ALL_QUEUE_KEYS = [
 ]
 
 # ─── Печь ──────────────────────────────────────────────────────
-FURNACE_CAPACITY_PARTS = 200
+FURNACE_CAPACITY_PARTS = 160
 FURNACE_MIN_FILL_RATIO = 0.6
 FURNACE_MAX_WAIT_MIN = 30
 FURNACE_PHASE_DURATIONS_SEC = {
@@ -283,23 +283,88 @@ INSPECTION_TIME_PER_PART_SEC = {
     "inspection":     480,   # 8 мин — полный контроль по 9 параметрам
 }
 
+# ─── Режимы сценариев и параметры дрейфа ────────────────────────
+# gradual: медленный дрейф через границы партий (для предиктивного ML/SPC).
+# step:    мгновенная полная аномалия на parts_cap деталей (для диагностики).
+#
+# Пороги для gradual:
+#   0 → scrap_threshold: сенсоры ползут, брака нет (зона раннего предупреждения).
+#   scrap_threshold → stop_threshold: пошли теги; сценарий завершается по
+#   stop_threshold ИЛИ концу текущей партии.
+#
+# Расчёт pace = DRIFT_SCRAP_THRESHOLD / 120:
+#   фаза 1 занимает ~120 деталей (2-3 партии) → длинная зона без брака.
+#   фаза 2: (1.0 - 0.85) / pace ≈ 21 деталь (в пределах 10-25).
+DRIFT_SCRAP_THRESHOLD = 0.85
+DRIFT_STOP_THRESHOLD = 1.0
+# Темп дрейфа по severity: сколько деталей нужно до scrap_threshold.
+# light → медленная деградация (~180 дет), gross → быстрая (~60 дет).
+DRIFT_PACE_BY_SEVERITY = {
+    "light": DRIFT_SCRAP_THRESHOLD / 180,   # ≈ 0.00472
+    "clear": DRIFT_SCRAP_THRESHOLD / 120,   # ≈ 0.00708
+    "gross": DRIFT_SCRAP_THRESHOLD / 60,    # ≈ 0.01417
+}
+
+# Лимит деталей для step-режима: parts_cap[severity] ± STEP_PARTS_CAP_JITTER.
+STEP_PARTS_CAP = {
+    "light": 15,
+    "clear": 10,
+    "gross": 5,
+}
+STEP_PARTS_CAP_JITTER = 2
+
+# ─── Печные сценарии: тайминги дрейфа и окна поимки ─────────────
+# GRADUAL (under/over_carburizing): печь обрабатывает деталь ПАРТИЕЙ, поэтому
+# дрейф привязан не к деталям, а ко времени фазы carburizing. Дрейф растёт
+# каждые FURNACE_DRIFT_STEP_MIN минут (240/5 = 48 шагов на фазу), а не одной
+# большой ступенью на этап. За одну фазу carburizing дрейф прибавляет
+# FURNACE_GRADUAL_DRIFT_PER_LOAD[severity] и сохраняется между загрузками.
+#
+# Severity = за сколько загрузок печи дойдём до отбраковки (light медленнее,
+# т.к. деградация долгая): gross — отбраковка на 2-й загрузке, clear — на 3-й,
+# light — на 4-й. На загрузке отбраковки дрейф пересекает scrap (0.85) и
+# доходит до stop (1.0) ВНУТРИ той же фазы carburizing: остаток 0.15
+# укладывается в фазу (десятки минут < 240), печь не успевает сменить этап —
+# поэтому отдельная задержка перед обслуживанием не нужна.
+FURNACE_DRIFT_STEP_MIN = 5
+FURNACE_GRADUAL_DRIFT_PER_LOAD = {
+    "gross": 0.55,   # L1=0.55 → на L2 дрейф пересекает 0.85 и доходит до 1.0
+    "clear": 0.38,   # L1=0.38, L2=0.76 → отбраковка на L3
+    "light": 0.27,   # L1=0.27, L2=0.54, L3=0.81 → отбраковка на L4
+}
+
+# STEP (quench_distortion): аномалия в фазе quenching (30 мин). Две временные
+# подфазы внутри quenching:
+#   elapsed < CATCH_MIN  → фаза "normal": ещё можно остановить (брака нет);
+#   elapsed >= CATCH_MIN → фаза "scrap": партия уходит в брак.
+# Вероятности исхода НЕТ: без внешней поимки партия ГАРАНТИРОВАННО уходит в
+# брак (отбраковка в [CATCH_MIN, SCRAP_MAX_MIN] мин, все детали в брак, печь →
+# обслуживание; суммарно ≤ 30 мин). «Поимку» в окне [0, CATCH_MIN) можно
+# инициировать только внешним вызовом FurnaceSubsystem.catch_step_scenario
+# (задел под ML/диагностику через endpoint equipment/maintenance).
+FURNACE_STEP_CATCH_MIN = 8
+FURNACE_STEP_SCRAP_MAX_MIN = 28
+
 # ─── Сценарии аномалий (Таблица B) ─────────────────────────────
 # Каждый сценарий: имя_причины → {
+#   "mode":        "gradual"|"step" — режим развития аномалии,
 #   "sensors":     dict сенсор → множитель (от нормы; >1 = рост, <1 = падение),
 #   "measurements": dict параметр → "up"|"down"|"both" (направление выхода
 #                  за допуск; должно быть совместимо с PARAM_FAIL_DIRECTION),
 #   "wo_duration_min": длительность ремонта (для maintenance WO),
-#   "applies_to":  множество machine_type, к которым применим (для UI),
 # }
 # Реестр организован по типу станка — UI берёт только подходящие сценарию.
 SCENARIOS_BY_MACHINE_TYPE = {
     # TURNING (1)
     "turning": {
         "tool_wear": {
+            "mode": "gradual",
+            # Targets рассчитаны по 3σ: при drift=DRIFT_SCRAP_THRESHOLD значение
+            # сенсора достигает mean ± 3σ (граница SPC). sensor_scale НЕ применяется.
             "sensors": {
-                "vibration_rms_mm_s": 1.5,
-                "spindle_load_percent": 1.3,
-                "spindle_bearing_temp": 1.15,
+                "vibration_rms_mm_s": 1.66,   # mean=0.8, std=0.15 → 3σ при drift=0.85
+                "spindle_load_percent": 1.39,  # mean=45, std=5
+                "spindle_bearing_temp": 1.24,  # mean=45, std=3
             },
             "measurements": {"blank_runout": "up"},
             "wo_duration_min": 25,
@@ -308,10 +373,11 @@ SCENARIOS_BY_MACHINE_TYPE = {
     # HOBBING (3)
     "hobbing": {
         "hob_wear": {
+            "mode": "gradual",
             "sensors": {
-                "vibration_rms_mm_s": 1.45,
-                "spindle_load_percent": 1.30,
-                "hob_bearing_temp": 1.15,
+                "vibration_rms_mm_s": 1.63,   # mean=1.4, std=0.25
+                "spindle_load_percent": 1.34,  # mean=62, std=6
+                "hob_bearing_temp": 1.26,      # mean=55, std=4
             },
             "measurements": {
                 "profile_deviation": "up",
@@ -320,17 +386,20 @@ SCENARIOS_BY_MACHINE_TYPE = {
             "wo_duration_min": 35,
         },
         "chatter": {
+            "mode": "step",
+            # Step targets гарантируют выход за 3σ даже при light severity (sensor_scale=0.6).
             "sensors": {
-                "vibration_rms_mm_s": 1.80,
-                "spindle_load_percent": 1.25,
+                "vibration_rms_mm_s": 1.90,   # было 1.80
+                "spindle_load_percent": 1.49,  # было 1.25
             },
             "measurements": {"profile_deviation": "up"},
             "wo_duration_min": 30,
         },
         "workpiece_loose": {
+            "mode": "step",
             "sensors": {
-                "vibration_rms_mm_s": 1.50,
-                "work_spindle_rpm": 1.10,   # нестабильно: фон, мы лишь повышаем mean
+                "vibration_rms_mm_s": 1.90,   # было 1.50
+                "work_spindle_rpm": 1.63,      # было 1.10
             },
             "measurements": {
                 "runout": "up",
@@ -342,9 +411,10 @@ SCENARIOS_BY_MACHINE_TYPE = {
     # SHAVING (1)
     "shaving": {
         "shaver_wear": {
+            "mode": "gradual",
             "sensors": {
-                "vibration_rms_mm_s": 1.40,
-                "spindle_load_percent": 1.25,
+                "vibration_rms_mm_s": 1.88,   # mean=0.8, std=0.20
+                "spindle_load_percent": 1.47,  # mean=30, std=4
             },
             "measurements": {
                 "profile_deviation": "up",
@@ -354,14 +424,23 @@ SCENARIOS_BY_MACHINE_TYPE = {
         },
     },
     # FURNACE (3)
+    # Печные сценарии привязаны к trigger_phase: anomaly_modifier применяется
+    # ТОЛЬКО во время этой фазы (см. furnace._generate_furnace_readings).
+    # Gradual (under/over_carburizing): дрейф растёт по времени в carburizing
+    #   (см. FURNACE_GRADUAL_DRIFT_PER_LOAD). sensor_scale НЕ применяется —
+    #   severity влияет только на число загрузок до отбраковки.
+    #   Targets по 3σ (как у остальных gradual): при drift=scrap_threshold
+    #   значение сенсора = mean ± 3σ. target = 1 ± (3σ/mean)/0.85.
+    # Step (quench_distortion): полная аномалия в quenching; sensor_scale по severity.
     "furnace": {
         "under_carburizing": {
+            "mode": "gradual",
             "trigger_phase": "carburizing",
             "sensors": {
-                "carbon_potential": 0.75,
-                "furnace_temp_zone1": 0.97,
-                "furnace_temp_zone2": 0.97,
-                "furnace_temp_zone3": 0.97,
+                "carbon_potential": 0.840,     # mean=1.10, std=0.05, ↓ (3σ при drift=0.85)
+                "furnace_temp_zone1": 0.9848,  # mean=927, std=4, ↓
+                "furnace_temp_zone2": 0.9848,
+                "furnace_temp_zone3": 0.9848,
             },
             "measurements": {
                 "surface_hardness_hrc": "down",
@@ -370,12 +449,13 @@ SCENARIOS_BY_MACHINE_TYPE = {
             "wo_duration_min": 180,
         },
         "over_carburizing": {
+            "mode": "gradual",
             "trigger_phase": "carburizing",
             "sensors": {
-                "carbon_potential": 1.30,
-                "furnace_temp_zone1": 1.03,
-                "furnace_temp_zone2": 1.03,
-                "furnace_temp_zone3": 1.03,
+                "carbon_potential": 1.160,     # mean=1.10, std=0.05, ↑ (3σ при drift=0.85)
+                "furnace_temp_zone1": 1.0152,  # mean=927, std=4, ↑
+                "furnace_temp_zone2": 1.0152,
+                "furnace_temp_zone3": 1.0152,
             },
             "measurements": {
                 "surface_hardness_hrc": "up",
@@ -385,6 +465,7 @@ SCENARIOS_BY_MACHINE_TYPE = {
             "wo_duration_min": 150,
         },
         "quench_distortion": {
+            "mode": "step",
             "trigger_phase": "quenching",
             "sensors": {
                 "quench_oil_flow": 0.40,
@@ -400,9 +481,10 @@ SCENARIOS_BY_MACHINE_TYPE = {
     # GRINDING (3)
     "grinding": {
         "grinding_chatter": {
+            "mode": "step",
             "sensors": {
-                "vibration_rms_mm_s": 1.80,
-                "wheel_bearing_temp": 1.15,
+                "vibration_rms_mm_s": 2.25,   # было 1.80; mean=0.6, std=0.15
+                "wheel_bearing_temp": 1.32,    # было 1.15; mean=47, std=3
             },
             "measurements": {
                 "surface_roughness": "up",
@@ -411,9 +493,10 @@ SCENARIOS_BY_MACHINE_TYPE = {
             "wo_duration_min": 30,
         },
         "coolant_loss": {
+            "mode": "step",
             "sensors": {
                 "coolant_flow": 0.30,
-                "coolant_temp_c": 1.35,
+                "coolant_temp_c": 1.40,    # mean=21, std=1.5 → +3.4σ при light
             },
             "measurements": {
                 "surface_roughness": "up",
@@ -422,9 +505,10 @@ SCENARIOS_BY_MACHINE_TYPE = {
             "wo_duration_min": 25,
         },
         "grinding_burn": {
+            "mode": "step",
             "sensors": {
                 "coolant_flow": 0.55,
-                "spindle_power_kw": 1.80,
+                "spindle_power_kw": 2.00,      # было 1.80; mean=10, std=2
             },
             "measurements": {
                 "surface_hardness_hrc": "down",
@@ -434,6 +518,9 @@ SCENARIOS_BY_MACHINE_TYPE = {
         },
     },
 }
+
+# Сценарии, связанные с износом инструмента: после их WO tool_wear сбрасывается в 0.
+TOOL_SCENARIO_TYPES = {"tool_wear", "hob_wear", "shaver_wear"}
 
 # ─── Severity: уровни тяжести сценария ─────────────────────────
 # Тяжесть масштабирует:

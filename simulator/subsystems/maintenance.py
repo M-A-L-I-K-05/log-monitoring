@@ -180,12 +180,25 @@ class MaintenanceSubsystem:
                 meta["status"] = meta.get("status") if meta.get("status") in ("auto_completed", "stopped") else "stopped"
             machine.active_scenario_id = None
 
+        # tool_wear сбрасывается только при инструментальном обслуживании.
+        # Ремонт по chatter/coolant_loss/etc инструмент не меняет.
+        is_tool_reset = (
+            wo.type == "tool_wear"
+            or wo.type == "preventive"
+            or (wo.type == "scenario" and wo.reason in config.TOOL_SCENARIO_TYPES)
+        )
         machine.state = "idle"
         machine.state_changed_at = now
-        machine.tool_wear = 0.0
-        machine.tool_wear_alarm_sent = False
+        if is_tool_reset:
+            machine.tool_wear = 0.0
+            machine.tool_wear_alarm_sent = False
         machine.cycles_since_maintenance = 0
         machine.last_maintenance_at = now
+
+        # Печь: после ремонта замороженные сценарием партии идут на измерение.
+        # (Время WO покрывает остывание печи — отдельной задержки не нужно.)
+        if machine.machine_type == "furnace":
+            self._release_frozen_furnace_batches(machine, now)
 
         # Размораживаем партию, если она была заморожена на этом станке.
         # (ситуация после tool_wear или после auto_completed сценария)
@@ -237,3 +250,35 @@ class MaintenanceSubsystem:
         wo.status = "completed"
         self.state.work_orders.pop(wo.wo_id, None)
         logger.info("completed WO %s on %s", wo.wo_id, wo.machine_id)
+
+    def _release_frozen_furnace_batches(self, machine, now: datetime) -> None:
+        """После ремонта печи: замороженные сценарием партии → queue_measurement."""
+        held = self.state.frozen_furnace_batches.pop(machine.machine_id, None)
+        if not held:
+            return
+        for batch_id in held:
+            batch = self.state.batches.get(batch_id)
+            if batch is None:
+                continue
+            duration = ((now - batch.stage_started_at).total_seconds()
+                        if batch.stage_started_at else 0.0)
+            actual_qty = batch.quantity - len(batch.failed_indices)
+            self.client.batch_completion(
+                batch, work_center="heat_treatment",
+                actual_quantity=actual_qty,
+                defect_count=batch.fails_count,
+                duration_sec=duration,
+                event_time=now,
+            )
+            batch.last_processed_stage = "heat_treatment"
+            batch.last_processed_machine_id = machine.machine_id
+            batch.stage = "queue_measurement"
+            batch.current_machine_id = None
+            batch.quality_hold = True
+            batch.is_frozen = False
+            batch.frozen_reason = None
+            self.client.batch_move(batch, from_center="heat_treatment",
+                                   to_center="measurement", event_time=now)
+            self.state.queues["queue_measurement"].append(batch)
+        logger.info("furnace %s: released %d frozen batches → measurement after WO",
+                    machine.machine_id, len(held))

@@ -126,14 +126,31 @@ class EquipmentSubsystem:
             machine.tool_wear = min(1.0, machine.tool_wear
                                     + config.TOOL_WEAR_PER_CYCLE[machine.machine_type])
 
+            # Дрейф: обновляем drift_progress и anomaly_modifier для gradual-сценариев.
+            if machine.active_scenario_id:
+                meta = self.state.scenarios_registry.get(machine.active_scenario_id)
+                if meta and meta.get("mode") == "gradual":
+                    pace = meta.get("pace") or 0.0
+                    machine.drift_progress = min(1.0, machine.drift_progress + pace)
+                    for sensor, target in meta.get("sensors_final", {}).items():
+                        machine.anomaly_modifier[sensor] = (
+                            1.0 + (target - 1.0) * machine.drift_progress
+                        )
+
             cycle_event_time = machine.state_changed_at + timedelta(
                 seconds=machine.parts_done_in_batch * cycle_sec
             )
 
-            # Пометка детали под активным сценарием (реальный индекс годной детали).
+            # Пометка детали под активным сценарием — только если drift_progress
+            # перешёл порог отбраковки (scrap_threshold). Для step: порог=0.0,
+            # поэтому все детали тегаются. Для gradual: фаза 1 не тегается.
             if machine.active_scenario_id:
-                part_idx = good[machine.parts_done_in_batch - 1]
-                batch.scenario_marked_indices[part_idx] = machine.active_scenario_id
+                meta = self.state.scenarios_registry.get(machine.active_scenario_id)
+                if meta:
+                    scrap_threshold = meta.get("scrap_threshold", 0.0)
+                    if machine.drift_progress >= scrap_threshold:
+                        part_idx = good[machine.parts_done_in_batch - 1]
+                        batch.scenario_marked_indices[part_idx] = machine.active_scenario_id
 
             # cycle_completion
             self.client.cycle_completion(
@@ -143,12 +160,13 @@ class EquipmentSubsystem:
                 event_time=cycle_event_time,
                 details={"batch_id": batch.batch_id,
                          "part_seq": machine.parts_done_in_batch,
-                         "tool_wear": round(machine.tool_wear, 4)},
+                         "tool_wear": round(machine.tool_wear, 4),
+                         "drift_progress": round(machine.drift_progress, 4)},
             )
 
-            # Сценарий: лимит в деталях. Если исчерпан → завершить сценарий
-            # (создать WO + перевести станок в maintenance). Все ОСТАВШИЕСЯ
-            # детали партии не будут обработаны, пока ремонт не закончится.
+            # Сценарий: проверка лимита завершения.
+            # gradual: stop_threshold ИЛИ конец партии в фазе 2 (drift >= scrap).
+            # step:    parts_cap исчерпан.
             if machine.active_scenario_id and self._scenario_limit_reached(machine, batch):
                 self._auto_complete_scenario(machine, batch, now)
                 return
@@ -277,7 +295,7 @@ class EquipmentSubsystem:
         batch.current_machine_id = None
         batch.parts_done_in_stage = 0
         batch.quality_hold = True
-        # последний обработавший станок — сохраним для quality (case B verify)
+        # последний обработавший станок — сохраним для quality (source_machine_id)
         # (уже выставлен в _transition_to_cooldown)
         # batch_move в виртуальный work_center "measurement" — для трассировки
         self.client.batch_move(batch, from_center=stage_just_done,
@@ -380,58 +398,81 @@ class EquipmentSubsystem:
 
     # ─── автозавершение сценария по лимиту деталей ──────────
     def _scenario_limit_reached(self, machine, batch) -> bool:
-        """Сценарий считает, сколько деталей через станок прошло с момента
-        старта сценария. Лимит хранится в state.scenarios_registry[scenario_id]."""
+        """Проверяет условие завершения сценария в зависимости от режима.
+
+        gradual:
+          - drift_progress >= stop_threshold → стоп (аномалия полная)
+          - drift_progress >= scrap_threshold И конец партии → стоп
+            (не начинаем новую партию в зоне отбраковки)
+          - drift_progress < scrap_threshold И конец партии → НЕ стоп
+            (продолжаем на следующей партии, это фаза 1)
+
+        step:
+          - кол-во помеченных деталей >= parts_cap → стоп
+        """
         sid = machine.active_scenario_id
         meta = self.state.scenarios_registry.get(sid) if sid else None
         if not meta:
             return False
-        limit = meta.get("parts_limit_effective", meta.get("parts_limit"))
-        processed = sum(1 for s in batch.scenario_marked_indices.values() if s == sid)
-        # Также считаем "ВСЯ ПАРТИЯ под сценарием" если уже достигли quantity:
-        # это самозавершение, чтобы запустить ремонт.
-        if processed >= limit:
-            return True
-        # Если партия закончилась — тоже завершить
-        if machine.parts_done_in_batch >= batch.effective_quantity:
-            return True
-        return False
+
+        mode = meta.get("mode", "step")
+
+        if mode == "gradual":
+            stop_threshold = meta.get("stop_threshold", 1.0)
+            scrap_threshold = meta.get("scrap_threshold", config.DRIFT_SCRAP_THRESHOLD)
+            if machine.drift_progress >= stop_threshold:
+                return True
+            if (machine.drift_progress >= scrap_threshold
+                    and machine.parts_done_in_batch >= batch.effective_quantity):
+                return True
+            return False
+        else:  # step
+            parts_cap = meta.get("parts_cap")
+            if parts_cap is None:
+                # fallback на старый механизм если parts_cap не задан
+                parts_cap = meta.get("parts_limit_effective", meta.get("parts_limit", 10))
+            tagged = sum(1 for s in batch.scenario_marked_indices.values() if s == sid)
+            return tagged >= parts_cap
 
     def _auto_complete_scenario(self, machine, batch, now: datetime) -> None:
-        """Сценарий исчерпал лимит → WO + станок в maintenance + заморозка партии."""
+        """Сценарий исчерпал лимит → alarm + WO + станок в maintenance + заморозка партии."""
         sid = machine.active_scenario_id
         meta = self.state.scenarios_registry.get(sid)
         if not meta:
             return
+
+        scenario_type = meta.get("scenario_type", "scenario")
+        tagged = sum(1 for s in batch.scenario_marked_indices.values() if s == sid)
+
+        # Alarm: фиксирует аномалию в Loki/Grafana с именами искажённых сенсоров.
+        self.client.alarm(
+            machine,
+            alarm_code=f"PROCESS_{scenario_type.upper()}",
+            severity="critical",
+            message=f"Process anomaly completed: {scenario_type}",
+            event_time=now,
+            details={
+                "scenario_id": sid,
+                "mode": meta.get("mode", "step"),
+                "drift_progress": round(machine.drift_progress, 4),
+                "sensors_affected": {k: round(v, 4)
+                                     for k, v in machine.anomaly_modifier.items()},
+                "parts_tagged": tagged,
+            },
+        )
+
         # Если на станке остались необработанные детали — партия замораживается.
-        # (Случай B — вся партия под сценарием — обработан выше, тут просто заморозка.)
         if machine.parts_done_in_batch < batch.effective_quantity:
             batch.is_frozen = True
-            batch.frozen_reason = f"scenario:{meta.get('scenario_type')}"
-
-        # Если ВСЯ (или почти вся, >=80%) партия прошла под сценарием —
-        # выставляем флаг на станке, чтобы следующая партия мерилась
-        # 10%-выборкой (verify-режим). Порог 80% — потому что в реальной работе
-        # из-за таймингов запуска несколько деталей в начале/конце могут
-        # ускользнуть от сценария; такой случай по семантике — всё-равно
-        # «вся партия с причиной».
-        marked_ratio = len(batch.scenario_marked_indices) / max(1, batch.effective_quantity)
-        if marked_ratio >= 0.80:
-            machine.verify_next_batch_with_sample = True
+            batch.frozen_reason = f"scenario:{scenario_type}"
 
         # WO от сценария: длительность из реестра.
         duration_min = meta.get("wo_duration_min", 30.0)
-        scenario_type = meta.get("scenario_type", "scenario")
         self.state.pending_scenario_wos.append(
             (machine.machine_id, scenario_type, float(duration_min))
         )
-        # снимаем сценарий со станка СЕЙЧАС (anomaly_modifier снимется когда
-        # пройдёт ремонт; но мы можем и сразу снять, чтобы сенсоры в простое
-        # не врали). Для чистоты — снимаем при maintenance complete.
-        # Здесь только помечаем сценарий как завершившийся.
         meta["status"] = "auto_completed"
         meta["ended_at"] = now
-        # Лог
         self.client.scenario_event(
             event="auto_completed",
             scenario_id=sid,
@@ -440,21 +481,19 @@ class EquipmentSubsystem:
             severity=meta.get("severity"),
             parts_limit=meta.get("parts_limit_effective", meta.get("parts_limit")),
             event_time=now,
-            details={"processed": sum(1 for s in batch.scenario_marked_indices.values() if s == sid),
+            details={"mode": meta.get("mode", "step"),
+                     "drift_progress": round(machine.drift_progress, 4),
+                     "parts_tagged": tagged,
                      "batch_id": batch.batch_id,
                      "wo_duration_min": duration_min},
         )
 
-        # Если ВСЯ партия закончена (sсенарий закрыл её сам) — фиксируем как
-        # batch_completion на этапе (станок переходит в "cooldown_then_maintenance").
+        # Если вся партия закончена — cooldown → idle → M-GMM.
         if machine.parts_done_in_batch >= batch.effective_quantity:
             self._transition_to_cooldown(machine, batch, now)
-            # cooldown → idle вернёт партию на M-GMM, MaintenanceSubsystem
-            # назначит WO когда станок дойдёт до idle.
             return
 
-        # Иначе: станок останется без работы (партия заморожена) →
-        # переводим в idle, MaintenanceSubsystem подхватит WO.
+        # Иначе: партия заморожена, станок → idle, MaintenanceSubsystem подхватит WO.
         old_state = machine.state
         machine.state = "idle"
         machine.state_changed_at = now

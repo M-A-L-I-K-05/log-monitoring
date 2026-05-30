@@ -16,3 +16,9 @@ class FurnaceLoad:
     # True после того, как части загрузки помечены scenario_marked_indices
     # (чтобы не помечать повторно при каждом тике).
     scenario_phase_applied: bool = False
+    # GRADUAL: время последнего шага накопления дрейфа в фазе carburizing.
+    last_drift_step_at: datetime | None = None
+    # STEP (quench_distortion): разыгранный исход и момент его наступления.
+    #   scenario_outcome ∈ {None, "caught", "scrap"}.
+    scenario_outcome: str | None = None
+    scenario_resolve_at: datetime | None = None

@@ -10,11 +10,6 @@
     каждая fail с причиной сценария, искажённые сенсоры/измерения.
   - Остальные (годные) → 10%-выборка → все pass (+ возможный фон).
 
-Случай B (verify_next_batch_with_sample):
-  - Сценарий захватил предыдущую партию целиком → следующая партия
-    меряется 10%-выборкой (даже без активного сценария) для подтверждения,
-    что станок после ремонта в норме.
-
 Фоновый брак:
   - BACKGROUND_FAIL_RATE = 0.003 на этап (≈1.5% за маршрут).
   - reason="background_random", source_machine_id=NULL, scenario_id=NULL.
@@ -56,7 +51,7 @@ class QualitySubsystem:
         Режимы:
           scenario — поголовно все помеченные сценарием (всегда fail),
           final    — 10% выборка годных на финальной инспекции,
-          verify   — 10% выборка (случай B, подтверждение нормы),
+          verify   — 10% выборка годного остатка партии, захваченной сценарием,
           spot     — 1 случайная годная на промежуточном этапе. Соседние
                      (spot_neighbor) добавляются ДИНАМИЧЕСКИ в equipment,
                      если spot-деталь забракована.
@@ -68,14 +63,6 @@ class QualitySubsystem:
         is_final = (stage == "inspection")
         last_proc_id = batch.last_processed_machine_id
 
-        # Случай B: предыдущий станок просил выборку на следующей чистой партии.
-        force_sample_on_clean = False
-        if last_proc_id and not scenario_indices:
-            last_proc_machine = self.state.machines.get(last_proc_id)
-            if last_proc_machine and last_proc_machine.verify_next_batch_with_sample:
-                force_sample_on_clean = True
-                last_proc_machine.verify_next_batch_with_sample = False
-
         plan: list[dict] = []
         for idx in scenario_indices:
             plan.append({"idx": idx, "mode": "scenario",
@@ -83,7 +70,7 @@ class QualitySubsystem:
                          "source": last_proc_id, "force_pass": False})
 
         if clean_indices:
-            if is_final or force_sample_on_clean or scenario_indices:
+            if is_final or scenario_indices:
                 n_sample = max(1, int(round(len(clean_indices) * config.INSPECTION_SAMPLE_RATIO)))
                 sample = sorted(random.sample(clean_indices, min(n_sample, len(clean_indices))))
                 mode = "final" if is_final else "verify"
@@ -135,7 +122,7 @@ class QualitySubsystem:
           "spot"          — 1 случайная деталь на промежуточном этапе,
           "spot_neighbor" — соседняя при force_pass=True,
           "final"         — 10%-выборка на финальной инспекции,
-          "verify"        — 10%-выборка случая B (подтверждение нормы).
+          "verify"        — 10%-выборка годного остатка партии под сценарием.
         """
         part_id = f"P-{batch.batch_id}-{part_idx:04d}"
         params = config.STAGE_MEASUREMENTS.get(stage, [])
