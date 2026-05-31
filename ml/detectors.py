@@ -1,8 +1,10 @@
-"""Детекция аномалий: PyOD ECOD (primary) + IsolationForest (secondary).
+"""Детекция аномалий: z-правило по сенсорам (главный триггер) + PyOD
+ECOD/IsolationForest (вспомогательные многомерные сигналы).
 
-Модель — на станок (фичи = все сенсоры станка в момент времени). ECOD ловит
-хвостовые одномерные аномалии (объяснимо, без тюнинга, детерминирован),
-IForest — многомерные комбинации. Итог комбинируется (any/both).
+Модель — на станок (фичи = все сенсоры станка в момент времени). Главный
+триггер — максимальное отклонение сенсора от своей обучающей нормы (z): не
+разбавляется числом нормальных сенсоров. ECOD/IForest докидывают аномалии-
+комбинации. Итог — ИЛИ всех источников (см. score()).
 """
 import logging
 from datetime import datetime, timezone
@@ -53,6 +55,12 @@ class MachineDetector:
         self.iforest = IForest(contamination=self.contamination,
                                random_state=config.IFOREST_RANDOM_STATE)
         self.iforest.fit(X.values)
+
+        if config.THRESHOLD_SIGMA > 0:
+            s = self.ecod.decision_scores_
+            self.ecod.threshold_ = s.mean() + config.THRESHOLD_SIGMA * s.std()
+            s = self.iforest.decision_scores_
+            self.iforest.threshold_ = s.mean() + config.THRESHOLD_SIGMA * s.std()
         # сохраняем mean/std обучающего окна для объяснимости (z-вклад сенсора)
         self.train_mean = X.mean()
         self.train_std = X.std(ddof=0).replace(0, np.nan)
@@ -79,9 +87,15 @@ class MachineDetector:
             "train_window": self.train_window,
         }
 
+    # Псевдо-канал персистентности для многомерных детекторов (ECOD/IForest):
+    # они не указывают на конкретный сенсор, поэтому в серию идут одним каналом.
+    DET_CHANNEL = "__det__"
+
     def score(self, wide: pd.DataFrame) -> pd.DataFrame | None:
         """Возвращает DataFrame по точкам: score_ecod, score_iforest, метки,
-        is_anomaly, top_sensor (сенсор с макс. отклонением по train-z)."""
+        is_anomaly, top_sensor (сенсор с макс. отклонением по train-z), а также
+        колонку hot — список «горячих» каналов в каждой точке (сенсоры за порогом
+        + DET_CHANNEL), по которым pipeline считает персистентность по-канально."""
         if not self.fitted:
             return None
         X = wide.reindex(columns=self.columns).ffill().dropna()
@@ -98,14 +112,46 @@ class MachineDetector:
         res["label_ecod"] = ecod_l.astype(int)
         res["score_iforest"] = if_s
         res["label_iforest"] = if_l.astype(int)
-        if config.ANOMALY_COMBINE == "both":
-            res["is_anomaly"] = (res["label_ecod"] == 1) & (res["label_iforest"] == 1)
-        else:
-            res["is_anomaly"] = (res["label_ecod"] == 1) | (res["label_iforest"] == 1)
 
-        # Объяснимость: какой сенсор сильнее всего отклонился от обучающей нормы.
+        # Отклонение каждого сенсора в σ его обучающей нормы (z). Берём МАКСИМУМ
+        # по сенсорам, а не сумму — поэтому нормальные сенсоры не «разбавляют»
+        # сигнал: один выскочивший сенсор всегда виден, сколько бы нормальных рядом.
         z = (X - self.train_mean) / self.train_std
         z = z.abs().replace([np.inf, -np.inf], np.nan).fillna(0.0)
         res["top_sensor"] = z.idxmax(axis=1)
         res["top_sensor_z"] = z.max(axis=1).round(3)
+
+        # Итог — ИЛИ трёх независимых источников (любой сработал → аномалия):
+        #   1) z-правило (главный триггер): любой сенсор вышел за ANOMALY_Z σ.
+        #      Ловит дрейф сценариев, не разбавляется числом нормальных сенсоров.
+        #   2) ECOD, 3) IForest — многомерные детекторы, докидывают аномалии-
+        #      комбинации. any/both — как их сочетать между собой.
+        if config.ANOMALY_Z > 0:
+            z_flag = res["top_sensor_z"] >= config.ANOMALY_Z
+        else:
+            z_flag = pd.Series(False, index=res.index)
+        if config.ANOMALY_COMBINE == "both":
+            det_flag = (res["label_ecod"] == 1) & (res["label_iforest"] == 1)
+        else:
+            det_flag = (res["label_ecod"] == 1) | (res["label_iforest"] == 1)
+        res["is_anomaly"] = z_flag | det_flag
+
+        # «Горячие» каналы каждой точки — для по-канальной персистентности в
+        # pipeline. Каждый сенсор за порогом ANOMALY_Z — отдельный канал; ECOD/
+        # IForest — один канал DET_CHANNEL. Серия «подряд» считается ОТДЕЛЬНО по
+        # каждому каналу, поэтому шум, прыгающий по разным сенсорам, не копит
+        # серию, а устойчивый дрейф одного сенсора — копит.
+        cols = list(z.columns)
+        if config.ANOMALY_Z > 0:
+            over = (z >= config.ANOMALY_Z).values
+        else:
+            over = np.zeros((len(z), len(cols)), dtype=bool)
+        det_vals = det_flag.values
+        hot = []
+        for i in range(len(z)):
+            chans = [cols[j] for j in range(len(cols)) if over[i, j]]
+            if det_vals[i]:
+                chans.append(self.DET_CHANNEL)
+            hot.append(chans)
+        res["hot"] = hot
         return res

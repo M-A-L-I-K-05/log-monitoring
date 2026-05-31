@@ -1,0 +1,131 @@
+{
+  "annotations": {"list": [{"builtIn": 1, "datasource": {"type": "grafana", "uid": "-- Grafana --"}, "enable": true, "hide": true, "iconColor": "rgba(0, 211, 255, 1)", "name": "Annotations & Alerts", "type": "dashboard"}]},
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "refresh": "5s",
+  "schemaVersion": 39,
+  "tags": ["ml", "vkr", "prophet", "forecast"],
+  "templating": {
+    "list": [
+      {
+        "name": "machine",
+        "label": "Станок",
+        "type": "query",
+        "datasource": {"type": "grafana-postgresql-datasource", "uid": "PCC52D03280B7034C"},
+        "definition": "SELECT machine_id FROM machines WHERE machine_type <> 'inspection' ORDER BY array_position(ARRAY['turning','hobbing','shaving','furnace','grinding']::text[], machine_type), machine_id",
+        "query": "SELECT machine_id FROM machines WHERE machine_type <> 'inspection' ORDER BY array_position(ARRAY['turning','hobbing','shaving','furnace','grinding']::text[], machine_type), machine_id",
+        "refresh": 2,
+        "sort": 0,
+        "includeAll": true,
+        "multi": true,
+        "current": {"text": "All", "value": "$__all"}
+      }
+    ]
+  },
+  "time": {"from": "now-6h", "to": "now"},
+  "timepicker": {},
+  "timezone": "utc",
+  "title": "ML — Прогноз Prophet (карточки станков)",
+  "uid": "ml-prophet",
+  "version": 1,
+  "panels": [
+    {
+      "id": 100,
+      "type": "row",
+      "title": "Сводка",
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 0},
+      "collapsed": false
+    },
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Станков с прогнозной аномалией",
+      "datasource": {"type": "grafana-postgresql-datasource", "uid": "PCC52D03280B7034C"},
+      "gridPos": {"h": 4, "w": 6, "x": 0, "y": 1},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "colorMode": "value", "graphMode": "none"},
+      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "thresholds": {"steps": [{"color": "green", "value": null}, {"color": "red", "value": 1}]}}, "overrides": []},
+      "targets": [{"refId": "A", "datasource": {"type": "grafana-postgresql-datasource", "uid": "PCC52D03280B7034C"}, "format": "table", "editorMode": "code", "rawQuery": true, "rawSql": "SELECT count(DISTINCT machine_id) FROM ml_prophet_status WHERE is_anomaly"}]
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Сенсоров с прогнозной аномалией",
+      "datasource": {"type": "grafana-postgresql-datasource", "uid": "PCC52D03280B7034C"},
+      "gridPos": {"h": 4, "w": 6, "x": 6, "y": 1},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "colorMode": "value", "graphMode": "none"},
+      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "thresholds": {"steps": [{"color": "green", "value": null}, {"color": "red", "value": 1}]}}, "overrides": []},
+      "targets": [{"refId": "A", "datasource": {"type": "grafana-postgresql-datasource", "uid": "PCC52D03280B7034C"}, "format": "table", "editorMode": "code", "rawQuery": true, "rawSql": "SELECT count(*) FROM ml_prophet_status WHERE is_anomaly"}]
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Сенсоров под наблюдением",
+      "datasource": {"type": "grafana-postgresql-datasource", "uid": "PCC52D03280B7034C"},
+      "gridPos": {"h": 4, "w": 6, "x": 12, "y": 1},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "colorMode": "value", "graphMode": "none"},
+      "fieldConfig": {"defaults": {"color": {"mode": "fixed", "fixedColor": "blue"}}, "overrides": []},
+      "targets": [{"refId": "A", "datasource": {"type": "grafana-postgresql-datasource", "uid": "PCC52D03280B7034C"}, "format": "table", "editorMode": "code", "rawQuery": true, "rawSql": "SELECT count(*) FROM ml_prophet_status"}]
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Обновлено (секунд назад)",
+      "datasource": {"type": "grafana-postgresql-datasource", "uid": "PCC52D03280B7034C"},
+      "gridPos": {"h": 4, "w": 6, "x": 18, "y": 1},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "colorMode": "value", "graphMode": "none"},
+      "fieldConfig": {"defaults": {"unit": "s", "color": {"mode": "thresholds"}, "thresholds": {"steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 60}, {"color": "red", "value": 180}]}}, "overrides": []},
+      "targets": [{"refId": "A", "datasource": {"type": "grafana-postgresql-datasource", "uid": "PCC52D03280B7034C"}, "format": "table", "editorMode": "code", "rawQuery": true, "rawSql": "SELECT COALESCE(EXTRACT(EPOCH FROM (now() - max(updated_at))), 0) FROM ml_prophet_status"}]
+    },
+    {
+      "id": 200,
+      "type": "row",
+      "title": "Карточки станков (зелёная — прогноз в норме, красная — уйдёт за норму)",
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 5},
+      "collapsed": false
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "$machine",
+      "datasource": {"type": "grafana-postgresql-datasource", "uid": "PCC52D03280B7034C"},
+      "gridPos": {"h": 5, "w": 4, "x": 0, "y": 6},
+      "repeat": "machine",
+      "repeatDirection": "h",
+      "maxPerRow": 6,
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "fields": "/^аномалий$/"}, "colorMode": "background", "graphMode": "none", "textMode": "value_and_name", "justifyMode": "center"},
+      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "thresholds": {"steps": [{"color": "green", "value": null}, {"color": "red", "value": 1}]}, "mappings": [{"type": "value", "options": {"0": {"text": "✓ норма", "color": "green"}}}]}, "overrides": []},
+      "targets": [{"refId": "A", "datasource": {"type": "grafana-postgresql-datasource", "uid": "PCC52D03280B7034C"}, "format": "table", "editorMode": "code", "rawQuery": true, "rawSql": "SELECT count(*) FILTER (WHERE is_anomaly) AS \"аномалий\", string_agg(sensor, ', ') FILTER (WHERE is_anomaly) AS \"сенсоры\" FROM ml_prophet_status WHERE machine_id = '$machine'"}]
+    },
+    {
+      "id": 300,
+      "type": "row",
+      "title": "Детализация",
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 11},
+      "collapsed": false
+    },
+    {
+      "id": 6,
+      "type": "table",
+      "title": "Прогнозируется выход за норму (по сенсорам)",
+      "datasource": {"type": "grafana-postgresql-datasource", "uid": "PCC52D03280B7034C"},
+      "gridPos": {"h": 9, "w": 24, "x": 0, "y": 12},
+      "options": {"showHeader": true, "sortBy": [{"displayName": "выход через, мин", "desc": false}]},
+      "fieldConfig": {"defaults": {}, "overrides": [{"matcher": {"id": "byName", "options": "точек за нормой"}, "properties": [{"id": "custom.cellOptions", "value": {"type": "color-background"}}, {"id": "color", "value": {"mode": "thresholds"}}, {"id": "thresholds", "value": {"steps": [{"color": "green", "value": null}, {"color": "red", "value": 1}]}}]}]},
+      "targets": [{"refId": "A", "datasource": {"type": "grafana-postgresql-datasource", "uid": "PCC52D03280B7034C"}, "format": "table", "editorMode": "code", "rawQuery": true, "rawSql": "SELECT machine_id AS \"станок\", machine_type AS \"тип\", context AS \"шестерня/фаза\", sensor AS \"сенсор\", n_breaches AS \"точек за нормой\", round(lead_min::numeric, 1) AS \"выход через, мин\", round(yhat_end::numeric, 2) AS \"прогноз (конец)\", round(norm_lower::numeric, 2) AS \"нижн. норма\", round(norm_upper::numeric, 2) AS \"верх. норма\" FROM ml_prophet_status WHERE is_anomaly AND machine_id IN ($machine) ORDER BY lead_min NULLS LAST"}]
+    },
+    {
+      "id": 7,
+      "type": "table",
+      "title": "Все сенсоры под наблюдением",
+      "datasource": {"type": "grafana-postgresql-datasource", "uid": "PCC52D03280B7034C"},
+      "gridPos": {"h": 10, "w": 24, "x": 0, "y": 21},
+      "options": {"showHeader": true, "sortBy": [{"displayName": "статус", "desc": true}]},
+      "fieldConfig": {"defaults": {}, "overrides": [{"matcher": {"id": "byName", "options": "статус"}, "properties": [{"id": "custom.cellOptions", "value": {"type": "color-background"}}, {"id": "color", "value": {"mode": "thresholds"}}, {"id": "thresholds", "value": {"steps": [{"color": "green", "value": null}, {"color": "red", "value": 1}]}}, {"id": "mappings", "value": [{"type": "value", "options": {"0": {"text": "норма"}, "1": {"text": "аномалия"}}}]}]}]},
+      "targets": [{"refId": "A", "datasource": {"type": "grafana-postgresql-datasource", "uid": "PCC52D03280B7034C"}, "format": "table", "editorMode": "code", "rawQuery": true, "rawSql": "SELECT machine_id AS \"станок\", context AS \"шестерня/фаза\", sensor AS \"сенсор\", (CASE WHEN is_anomaly THEN 1 ELSE 0 END) AS \"статус\", n_breaches AS \"точек за нормой\", round(lead_min::numeric, 1) AS \"выход через, мин\", round(yhat_end::numeric, 2) AS \"прогноз (конец)\" FROM ml_prophet_status WHERE machine_id IN ($machine) ORDER BY is_anomaly DESC, machine_id, sensor"}]
+    }
+  ]
+}

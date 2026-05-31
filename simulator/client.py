@@ -93,11 +93,13 @@ class FactoryClient:
             return {"sync": False, "error": str(exc)}
 
     # ─── EQUIPMENT ─────────────────────────────────────────────
-    def sensor_reading(self, machine, readings: dict, event_time: datetime) -> None:
+    def sensor_reading(self, machine, readings: dict, event_time: datetime,
+                       product_code: str | None = None) -> None:
         self._sensor_buffer.append({
             "machine_id":   machine.machine_id,
             "machine_type": machine.machine_type,
             "work_center":  machine.work_center,
+            "product_code": product_code,
             "readings":     readings,
             "event_time":   event_time.isoformat(),
         })

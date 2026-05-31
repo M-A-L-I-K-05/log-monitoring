@@ -97,7 +97,8 @@ class EquipmentSubsystem:
         next_sensor_at = machine.last_sensor_sent_at + sensor_step
         while next_sensor_at <= now:
             readings = self._generate_sensor_readings(machine, batch.product_code)
-            self.client.sensor_reading(machine, readings, event_time=next_sensor_at)
+            self.client.sensor_reading(machine, readings, event_time=next_sensor_at,
+                                       product_code=batch.product_code)
             machine.last_sensor_sent_at = next_sensor_at
             next_sensor_at += sensor_step
 
@@ -189,7 +190,8 @@ class EquipmentSubsystem:
         next_sensor_at = machine.last_sensor_sent_at + sensor_step
         while next_sensor_at <= now:
             readings = self._generate_sensor_readings(machine, batch.product_code)
-            self.client.sensor_reading(machine, readings, event_time=next_sensor_at)
+            self.client.sensor_reading(machine, readings, event_time=next_sensor_at,
+                                       product_code=batch.product_code)
             machine.last_sensor_sent_at = next_sensor_at
             next_sensor_at += sensor_step
 

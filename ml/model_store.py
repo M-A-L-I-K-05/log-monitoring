@@ -179,3 +179,20 @@ def delete_version(version: str) -> bool:
             pass
     logger.info("model_version_deleted", extra={"details": {"version": version}})
     return True
+
+
+def delete_all_versions() -> int:
+    """Удаляет ВСЕ версии весов и указатель активной. Возвращает число удалённых."""
+    root = _root()
+    n = 0
+    for name in os.listdir(root):
+        vdir = os.path.join(root, name)
+        if os.path.isdir(vdir):
+            shutil.rmtree(vdir)
+            n += 1
+    try:
+        os.remove(os.path.join(root, ACTIVE_FILE))
+    except FileNotFoundError:
+        pass
+    logger.info("model_all_versions_deleted", extra={"details": {"count": n}})
+    return n

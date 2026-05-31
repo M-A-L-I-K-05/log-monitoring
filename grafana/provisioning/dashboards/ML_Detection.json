@@ -1,0 +1,131 @@
+{
+  "annotations": {"list": [{"builtIn": 1, "datasource": {"type": "grafana", "uid": "-- Grafana --"}, "enable": true, "hide": true, "iconColor": "rgba(0, 211, 255, 1)", "name": "Annotations & Alerts", "type": "dashboard"}]},
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "refresh": "5s",
+  "schemaVersion": 39,
+  "tags": ["ml", "vkr", "detection"],
+  "templating": {
+    "list": [
+      {
+        "name": "machine",
+        "label": "Станок",
+        "type": "query",
+        "datasource": {"type": "grafana-postgresql-datasource", "uid": "PCC52D03280B7034C"},
+        "definition": "SELECT DISTINCT machine_id FROM ml_anomalies ORDER BY 1",
+        "query": "SELECT DISTINCT machine_id FROM ml_anomalies ORDER BY 1",
+        "refresh": 2,
+        "sort": 1,
+        "includeAll": false,
+        "multi": false,
+        "current": {}
+      }
+    ]
+  },
+  "time": {"from": "2026-01-01T00:00:00.000Z", "to": "2026-02-01T00:00:00.000Z"},
+  "timepicker": {},
+  "timezone": "utc",
+  "title": "ML — Детекция аномалий (проверка работы)",
+  "uid": "ml-detection-check",
+  "version": 2,
+  "panels": [
+    {
+      "id": 100,
+      "type": "row",
+      "title": "Все станки вместе (ось — виртуальное время)",
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 0},
+      "collapsed": false
+    },
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Аномалий (в окне)",
+      "datasource": {"type": "grafana-postgresql-datasource", "uid": "PCC52D03280B7034C"},
+      "gridPos": {"h": 4, "w": 6, "x": 0, "y": 1},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "colorMode": "value", "graphMode": "area"},
+      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "thresholds": {"steps": [{"color": "green", "value": null}, {"color": "red", "value": 1}]}}, "overrides": []},
+      "targets": [{"refId": "A", "datasource": {"type": "grafana-postgresql-datasource", "uid": "PCC52D03280B7034C"}, "format": "table", "editorMode": "code", "rawQuery": true, "rawSql": "SELECT count(*) FROM ml_anomalies WHERE is_anomaly AND $__timeFilter(event_time)"}]
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Станков с аномалиями (в окне)",
+      "datasource": {"type": "grafana-postgresql-datasource", "uid": "PCC52D03280B7034C"},
+      "gridPos": {"h": 4, "w": 6, "x": 6, "y": 1},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "colorMode": "value", "graphMode": "none"},
+      "fieldConfig": {"defaults": {"color": {"mode": "fixed", "fixedColor": "orange"}}, "overrides": []},
+      "targets": [{"refId": "A", "datasource": {"type": "grafana-postgresql-datasource", "uid": "PCC52D03280B7034C"}, "format": "table", "editorMode": "code", "rawQuery": true, "rawSql": "SELECT count(DISTINCT machine_id) FROM ml_anomalies WHERE is_anomaly AND $__timeFilter(event_time)"}]
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Точек обработано (в окне)",
+      "datasource": {"type": "grafana-postgresql-datasource", "uid": "PCC52D03280B7034C"},
+      "gridPos": {"h": 4, "w": 6, "x": 12, "y": 1},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "colorMode": "value", "graphMode": "none"},
+      "fieldConfig": {"defaults": {"color": {"mode": "fixed", "fixedColor": "blue"}}, "overrides": []},
+      "targets": [{"refId": "A", "datasource": {"type": "grafana-postgresql-datasource", "uid": "PCC52D03280B7034C"}, "format": "table", "editorMode": "code", "rawQuery": true, "rawSql": "SELECT count(*) FROM ml_anomalies WHERE $__timeFilter(event_time)"}]
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Прогонов фона (в окне)",
+      "datasource": {"type": "grafana-postgresql-datasource", "uid": "PCC52D03280B7034C"},
+      "gridPos": {"h": 4, "w": 6, "x": 18, "y": 1},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "colorMode": "value", "graphMode": "none"},
+      "fieldConfig": {"defaults": {"color": {"mode": "fixed", "fixedColor": "green"}}, "overrides": []},
+      "targets": [{"refId": "A", "datasource": {"type": "grafana-postgresql-datasource", "uid": "PCC52D03280B7034C"}, "format": "table", "editorMode": "code", "rawQuery": true, "rawSql": "SELECT count(*) FROM ml_runs WHERE kind = 'run' AND $__timeFilter(window_to)"}]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Аномалии по станкам во времени (столбики = число аномалий за интервал, цвет = станок)",
+      "datasource": {"type": "grafana-postgresql-datasource", "uid": "PCC52D03280B7034C"},
+      "gridPos": {"h": 9, "w": 24, "x": 0, "y": 5},
+      "fieldConfig": {"defaults": {"custom": {"drawStyle": "bars", "lineWidth": 1, "fillOpacity": 70, "showPoints": "never", "stacking": {"mode": "normal", "group": "A"}}, "color": {"mode": "palette-classic"}, "min": 0}, "overrides": []},
+      "options": {"legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [{"refId": "A", "datasource": {"type": "grafana-postgresql-datasource", "uid": "PCC52D03280B7034C"}, "format": "time_series", "editorMode": "code", "rawQuery": true, "rawSql": "SELECT $__timeGroupAlias(event_time, $__interval), machine_id AS metric, count(*) FILTER (WHERE is_anomaly) AS value FROM ml_anomalies WHERE $__timeFilter(event_time) GROUP BY 1, machine_id ORDER BY 1"}]
+    },
+    {
+      "id": 6,
+      "type": "table",
+      "title": "Сводка по станкам (в окне): сколько аномалий из скольких точек",
+      "datasource": {"type": "grafana-postgresql-datasource", "uid": "PCC52D03280B7034C"},
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 14},
+      "options": {"showHeader": true, "sortBy": [{"displayName": "аномалий", "desc": true}]},
+      "fieldConfig": {"defaults": {}, "overrides": [{"matcher": {"id": "byName", "options": "аномалий"}, "properties": [{"id": "custom.cellOptions", "value": {"type": "color-background"}}, {"id": "color", "value": {"mode": "thresholds"}}, {"id": "thresholds", "value": {"steps": [{"color": "green", "value": null}, {"color": "red", "value": 1}]}}]}]},
+      "targets": [{"refId": "A", "datasource": {"type": "grafana-postgresql-datasource", "uid": "PCC52D03280B7034C"}, "format": "table", "editorMode": "code", "rawQuery": true, "rawSql": "SELECT machine_id AS \"станок\", machine_type AS \"тип\", product_code AS \"шестерня/фаза\", count(*) FILTER (WHERE is_anomaly) AS \"аномалий\", count(*) AS \"точек\" FROM ml_anomalies WHERE $__timeFilter(event_time) GROUP BY machine_id, machine_type, product_code ORDER BY \"аномалий\" DESC"}]
+    },
+    {
+      "id": 200,
+      "type": "row",
+      "title": "Выбранный станок: $machine",
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 22},
+      "collapsed": false
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Аномалии станка $machine — отклонение (z, σ), цвет = сенсор",
+      "datasource": {"type": "grafana-postgresql-datasource", "uid": "PCC52D03280B7034C"},
+      "gridPos": {"h": 9, "w": 24, "x": 0, "y": 23},
+      "fieldConfig": {"defaults": {"custom": {"drawStyle": "points", "pointSize": 7, "lineWidth": 0, "showPoints": "always"}, "color": {"mode": "palette-classic"}, "min": 0, "unit": "none"}, "overrides": []},
+      "options": {"legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi"}},
+      "targets": [{"refId": "A", "datasource": {"type": "grafana-postgresql-datasource", "uid": "PCC52D03280B7034C"}, "format": "time_series", "editorMode": "code", "rawQuery": true, "rawSql": "SELECT event_time AS \"time\", top_sensor AS metric, top_sensor_z AS value FROM ml_anomalies WHERE is_anomaly AND machine_id = '$machine' AND $__timeFilter(event_time) ORDER BY event_time"}]
+    },
+    {
+      "id": 8,
+      "type": "table",
+      "title": "Последние аномалии станка $machine (виртуальное время)",
+      "datasource": {"type": "grafana-postgresql-datasource", "uid": "PCC52D03280B7034C"},
+      "gridPos": {"h": 9, "w": 24, "x": 0, "y": 32},
+      "options": {"showHeader": true},
+      "fieldConfig": {"defaults": {}, "overrides": []},
+      "targets": [{"refId": "A", "datasource": {"type": "grafana-postgresql-datasource", "uid": "PCC52D03280B7034C"}, "format": "table", "editorMode": "code", "rawQuery": true, "rawSql": "SELECT event_time AS \"событие (вирт.)\", product_code AS \"шестерня/фаза\", top_sensor AS \"сенсор\", round(top_sensor_z::numeric, 2) AS \"z, σ\", round(score_ecod::numeric, 3) AS ecod, round(score_iforest::numeric, 3) AS iforest FROM ml_anomalies WHERE is_anomaly AND machine_id = '$machine' AND $__timeFilter(event_time) ORDER BY event_time DESC LIMIT 200"}]
+    }
+  ]
+}

@@ -78,3 +78,19 @@ tr:hover td { background: #262626; }
 .empty { color: #777; font-style: italic; padding: 0.6rem 0; }
 .toggle { font-size: 0.82rem; color: #ccc; cursor: pointer; user-select: none; }
 .toggle input { vertical-align: middle; margin-right: 0.3rem; }
+
+/* Карточка-инструкция перед обучением */
+.hint-card { background: #1e2820; border: 1px solid #3a5a3a; color: #c8e0c8; font-size: 0.83rem; margin-bottom: 0; }
+.hint-card ol { margin: 0.4rem 0 0 1.2rem; padding: 0; }
+.hint-card li { margin-bottom: 0.25rem; }
+
+/* Результат обучения */
+#train-result { white-space: normal; font-family: inherit; }
+.result-ok   { color: #7ec87e; font-weight: 600; margin-bottom: 0.3rem; }
+.result-warn { color: #e8c87e; font-weight: 600; margin-bottom: 0.3rem; }
+.result-hint { color: #e8c87e; font-size: 0.8rem; margin-top: 0.4rem; font-style: italic; }
+.result-list { margin: 0.1rem 0 0.5rem 1.2rem; padding: 0; font-size: 0.8rem; color: #bbb; }
+.result-list code { background: #2a2a2a; padding: 0.1rem 0.3rem; border-radius: 3px; color: #9cd; }
+
+/* «Взведённая» кнопка опасного действия (двойной клик для подтверждения) */
+.btn.armed { outline: 2px solid #f1c40f; outline-offset: 1px; font-weight: 700; }

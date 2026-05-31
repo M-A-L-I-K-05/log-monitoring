@@ -14,11 +14,6 @@ async function api(method, path, body) {
     return data;
 }
 
-function show(el, obj) {
-    el.hidden = false;
-    el.textContent = typeof obj === "string" ? obj : JSON.stringify(obj, null, 2);
-}
-
 function fmtTime(iso) {
     if (!iso) return "—";
     return iso.replace("T", " ").replace(/\.\d+.*$/, "").replace(/Z$/, "");
@@ -29,7 +24,15 @@ function setBadge(el, text, cls) {
     el.className = "badge " + cls;
 }
 
-// ── status / health ──────────────────────────────────────────
+// Разбивает ключ "turning__SPUR-M" → ["turning", "SPUR-M"]
+function splitKey(key) {
+    if (!key) return ["—", "—"];
+    const sep = key.indexOf("__");
+    if (sep === -1) return [key, "—"];
+    return [key.slice(0, sep), key.slice(sep + 2)];
+}
+
+// ── статус / health ───────────────────────────────────────────
 async function refreshStatus() {
     try {
         const h = await api("GET", "/health");
@@ -47,36 +50,48 @@ async function refreshStatus() {
                  bg.enabled ? "ok" : "off");
         $("run-count").textContent = "прогонов: " + (st.run_count ?? 0);
 
+        // показываем требуемое кол-во точек если пришло
+        if (st.train_points_required)
+            $("train-points-required").textContent = st.train_points_required;
+
         // тумблеры режима
         $("bg-enabled").checked = !!bg.enabled;
-        $("bg-retrain").checked = !!bg.retrain_enabled;
         if (document.activeElement !== $("bg-interval"))
             $("bg-interval").value = bg.interval_sec ?? "";
+        if (bg.lookback_sec != null)
+            $("bg-lookback").textContent = `окно Loki: ${bg.lookback_sec} с`;
 
-        renderMachines(st.detectors || []);
+        $("prophet-enabled").checked = !!bg.prophet_enabled;
+        if (bg.prophet_cycle_sec != null)
+            $("prophet-info").textContent =
+                `цикл прогноза: раз в ${bg.prophet_cycle_sec} с (каждые ${bg.prophet_every} тиков фона)`;
+
+        renderModels(st.detectors || []);
     } catch (e) { /* сервис мог ещё подниматься */ }
 }
 
-function renderMachines(dets) {
+// ── таблица моделей активной версии ──────────────────────────
+function renderModels(dets) {
     const tb = $("machines-tbody");
     tb.innerHTML = "";
     $("machines-count").textContent = dets.length ? `(${dets.length})` : "";
     $("machines-empty").hidden = dets.length > 0;
+
     dets.sort((a, b) => (a.machine_id || "").localeCompare(b.machine_id || ""));
     for (const d of dets) {
+        const [mtype, pcode] = splitKey(d.machine_id);
         const tr = document.createElement("tr");
         tr.innerHTML = `
-            <td class="mono">${d.machine_id}</td>
-            <td>${d.machine_type || "—"}</td>
+            <td class="mono">${mtype}</td>
+            <td class="mono">${pcode}</td>
             <td>${d.n_train ?? "—"}</td>
             <td>${d.contamination ?? "—"}</td>
-            <td class="muted">${(d.features || []).join(", ")}</td>
             <td class="mono muted">${fmtTime(d.trained_at)}</td>`;
         tb.appendChild(tr);
     }
 }
 
-// ── модели / версии ───────────────────────────────────────────
+// ── версии весов ──────────────────────────────────────────────
 async function refreshModels() {
     let data;
     try { data = await api("GET", "/models"); } catch { return; }
@@ -97,18 +112,19 @@ async function refreshModels() {
             <td></td>`;
         const actions = tr.lastElementChild;
         if (!v.active) {
-            const b = mkBtn("Подключить", "btn-blue", async () => {
+            actions.appendChild(mkBtn("Подключить", "btn-blue", async () => {
                 await api("POST", "/models/activate", { version: v.version });
                 await refreshModels(); await refreshStatus();
-            });
-            actions.appendChild(b);
+            }));
         }
-        const del = mkBtn("Удалить", "btn-red", async () => {
-            if (!confirm(`Удалить версию ${v.version}?`)) return;
+        const delBtn = document.createElement("button");
+        delBtn.className = "btn btn-tiny btn-red";
+        delBtn.style.marginRight = "0.35rem";
+        armConfirm(delBtn, "Удалить", async () => {
             await api("DELETE", "/models/" + encodeURIComponent(v.version));
             await refreshModels(); await refreshStatus();
         });
-        actions.appendChild(del);
+        actions.appendChild(delBtn);
         tb.appendChild(tr);
     }
 }
@@ -126,6 +142,64 @@ function mkBtn(text, cls, onClick) {
     return b;
 }
 
+// Подтверждение опасного действия ДВОЙНЫМ кликом по самой кнопке — без нативного
+// confirm() (в некоторых браузерах/режимах он молча возвращает «отмена», и
+// удаление/сброс срываются без видимой причины). Первый клик «взводит» кнопку
+// (меняет надпись), второй в течение 4с — выполняет. Иначе — сброс.
+function armConfirm(btn, normalText, action) {
+    let armed = false, timer = null;
+    btn.textContent = normalText;
+    btn.onclick = async () => {
+        if (!armed) {
+            armed = true;
+            btn.textContent = "Точно? ещё раз";
+            btn.classList.add("armed");
+            timer = setTimeout(() => {
+                armed = false; btn.textContent = normalText; btn.classList.remove("armed");
+            }, 4000);
+            return;
+        }
+        clearTimeout(timer); armed = false; btn.classList.remove("armed");
+        btn.disabled = true;
+        try { await action(); }
+        catch (e) { alert("Ошибка: " + e.message); }
+        finally { btn.disabled = false; btn.textContent = normalText; }
+    };
+    return btn;
+}
+
+// ── отображение результата обучения ──────────────────────────
+function showTrainResult(res) {
+    const el = $("train-result");
+    el.hidden = false;
+
+    let html = "";
+
+    if (res.trained && res.trained.length) {
+        html += `<div class="result-ok">✓ Обучено моделей: ${res.trained.length}</div>`;
+        html += `<ul class="result-list">`;
+        for (const t of res.trained)
+            html += `<li><code>${t.key}</code> — ${t.points} точек</li>`;
+        html += `</ul>`;
+    }
+
+    if (res.insufficient && res.insufficient.length) {
+        html += `<div class="result-warn">⚠ Недостаточно данных (${res.insufficient.length}):</div>`;
+        html += `<ul class="result-list">`;
+        for (const s of res.insufficient)
+            html += `<li><code>${s.key}</code> — ${s.points} / ${s.needed} точек</li>`;
+        html += `</ul>`;
+    }
+
+    if (res.message)
+        html += `<div class="result-hint">${res.message}</div>`;
+
+    if (!html)
+        html = `<pre>${JSON.stringify(res, null, 2)}</pre>`;
+
+    el.innerHTML = html;
+}
+
 // ── действия ──────────────────────────────────────────────────
 function num(el) {
     const v = el.value.trim();
@@ -141,49 +215,81 @@ async function withBtn(btn, fn) {
 
 $("btn-train").onclick = () => withBtn($("btn-train"), async () => {
     const body = {
-        real_lookback_min: num($("t-lookback")),
         contamination: num($("t-contam")),
         tag: $("t-tag").value.trim() || null,
     };
     const res = await api("POST", "/train", body);
-    show($("train-result"), res);
+    showTrainResult(res);
     await refreshModels(); await refreshStatus();
 });
 
 $("btn-detect").onclick = () => withBtn($("btn-detect"), async () => {
-    show($("run-result"), await api("POST", "/detect", {}));
+    const res = await api("POST", "/detect", {});
+    $("run-result").hidden = false;
+    $("run-result").textContent = JSON.stringify(res, null, 2);
     await refreshStatus();
 });
 
 $("btn-forecast").onclick = () => withBtn($("btn-forecast"), async () => {
-    show($("run-result"), await api("POST", "/forecast", {}));
+    const res = await api("POST", "/forecast", {});
+    $("run-result").hidden = false;
+    $("run-result").textContent = JSON.stringify(res, null, 2);
     await refreshStatus();
 });
 
 $("btn-evaluate").onclick = () => withBtn($("btn-evaluate"), async () => {
-    show($("eval-result"), await api("POST", "/evaluate", {}));
+    const res = await api("POST", "/evaluate");
+    $("eval-result").hidden = false;
+    $("eval-result").textContent = JSON.stringify(res, null, 2);
 });
 
-$("btn-reset").onclick = () => withBtn($("btn-reset"), async () => {
-    if (!confirm("Очистить результаты в БД (аномалии/прогнозы/прогоны)? Веса останутся.")) return;
-    show($("run-result"), await api("POST", "/reset", {}));
+armConfirm($("btn-reset"), "Сбросить результаты", async () => {
+    const res = await api("POST", "/reset", {});
+    $("run-result").hidden = false;
+    $("run-result").textContent = JSON.stringify(res, null, 2);
     await refreshStatus();
 });
 
+armConfirm($("btn-delete-all"), "Стереть все модели", async () => {
+    const res = await api("DELETE", "/models");
+    $("run-result").hidden = false;
+    $("run-result").textContent = `Удалено версий: ${res.deleted_versions}`;
+    await refreshModels(); await refreshStatus();
+});
+
+// Галочку применяем СРАЗУ при переключении — иначе фоновый опрос статуса
+// (refreshStatus каждые 5с) перечитает состояние сервера и вернёт её обратно.
+$("bg-enabled").onchange = () => withBtn($("btn-loop"), async () => {
+    await api("POST", "/loop", { enabled: $("bg-enabled").checked });
+    await refreshStatus();
+});
+
+// «Применить» — ТОЛЬКО интервал (вкл/выкл живёт на галочке bg-enabled).
+// Окно запроса к Loki сервер сам считает как интервал + запас (см. /loop).
 $("btn-loop").onclick = () => withBtn($("btn-loop"), async () => {
-    const body = {
-        enabled: $("bg-enabled").checked,
-        retrain_enabled: $("bg-retrain").checked,
-        interval_sec: num($("bg-interval")),
-    };
-    await api("POST", "/loop", body);
+    const interval = num($("bg-interval"));
+    if (interval === null) { alert("Введите интервал в секундах"); return; }
+    await api("POST", "/loop", { interval_sec: interval });
+    await refreshStatus();
+});
+
+// Тумблер Prophet-контура — применяем сразу (как и фоновый поток).
+$("prophet-enabled").onchange = () => withBtn($("btn-prophet-now"), async () => {
+    await api("POST", "/prophet_loop", { enabled: $("prophet-enabled").checked });
+    await refreshStatus();
+});
+
+// «Прогноз сейчас» — один прогнозный цикл вручную (первое заполнение карточек).
+$("btn-prophet-now").onclick = () => withBtn($("btn-prophet-now"), async () => {
+    const res = await api("POST", "/prophet_cycle", {});
+    $("run-result").hidden = false;
+    $("run-result").textContent = JSON.stringify(res, null, 2);
     await refreshStatus();
 });
 
 // ── init ──────────────────────────────────────────────────────
-async function tick() { await refreshStatus(); }
 (async () => {
     await refreshModels();
     await refreshStatus();
-    setInterval(tick, 5000);
+    setInterval(refreshStatus, 5000);
 })();

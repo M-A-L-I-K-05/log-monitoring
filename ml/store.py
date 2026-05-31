@@ -34,7 +34,9 @@ CREATE TABLE IF NOT EXISTS ml_anomalies (
     id            BIGSERIAL   PRIMARY KEY,
     run_id        BIGINT      REFERENCES ml_runs(run_id) ON DELETE CASCADE,
     machine_id    TEXT        NOT NULL,
-    event_time    TIMESTAMP   NOT NULL,            -- виртуальное время точки
+    machine_type  TEXT,
+    product_code  TEXT,
+    event_time    TIMESTAMP   NOT NULL,
     score_ecod    REAL,
     score_iforest REAL,
     is_anomaly    BOOLEAN     NOT NULL,
@@ -45,6 +47,7 @@ CREATE TABLE IF NOT EXISTS ml_anomalies (
 CREATE INDEX IF NOT EXISTS ml_anomalies_machine_idx ON ml_anomalies (machine_id);
 CREATE INDEX IF NOT EXISTS ml_anomalies_time_idx    ON ml_anomalies (event_time);
 CREATE INDEX IF NOT EXISTS ml_anomalies_flag_idx    ON ml_anomalies (is_anomaly);
+CREATE INDEX IF NOT EXISTS ml_anomalies_type_idx    ON ml_anomalies (machine_type, product_code);
 
 CREATE TABLE IF NOT EXISTS ml_forecasts (
     id            BIGSERIAL   PRIMARY KEY,
@@ -61,6 +64,27 @@ CREATE TABLE IF NOT EXISTS ml_forecasts (
 );
 CREATE INDEX IF NOT EXISTS ml_forecasts_machine_idx ON ml_forecasts (machine_id, sensor);
 CREATE INDEX IF NOT EXISTS ml_forecasts_time_idx    ON ml_forecasts (ts);
+
+-- Витрина статуса Prophet для карточек Grafana: одна строка на (станок, сенсор),
+-- перезаписывается каждым прогнозным циклом. is_anomaly=true → прогноз выходит за
+-- норму сенсора в пределах горизонта (предиктивный сигнал).
+CREATE TABLE IF NOT EXISTS ml_prophet_status (
+    machine_id       TEXT        NOT NULL,
+    machine_type     TEXT,
+    context          TEXT,                          -- тип шестерни или фаза печи
+    sensor           TEXT        NOT NULL,
+    is_anomaly       BOOLEAN     NOT NULL DEFAULT FALSE,
+    n_breaches       INTEGER     NOT NULL DEFAULT 0, -- точек прогноза за нормой
+    horizon_points   INTEGER     NOT NULL DEFAULT 0, -- всего точек на горизонте
+    lead_min         REAL,                           -- через сколько мин первый выход
+    norm_lower       REAL,
+    norm_upper       REAL,
+    yhat_end         REAL,                           -- прогноз на конце горизонта
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (machine_id, sensor)
+);
+CREATE INDEX IF NOT EXISTS ml_prophet_status_machine_idx ON ml_prophet_status (machine_id);
+CREATE INDEX IF NOT EXISTS ml_prophet_status_flag_idx    ON ml_prophet_status (is_anomaly);
 """
 
 
@@ -80,6 +104,20 @@ def close() -> None:
 def ensure_tables() -> None:
     with _pool.connection() as conn:
         with conn.cursor() as cur:
+            # Сначала миграция: колонки должны существовать до CREATE INDEX
+            cur.execute("""
+                DO $$ BEGIN
+                    ALTER TABLE ml_anomalies ADD COLUMN machine_type TEXT;
+                EXCEPTION WHEN duplicate_column THEN NULL;
+                END $$;
+            """)
+            cur.execute("""
+                DO $$ BEGIN
+                    ALTER TABLE ml_anomalies ADD COLUMN product_code TEXT;
+                EXCEPTION WHEN duplicate_column THEN NULL;
+                END $$;
+            """)
+            # Затем DDL (CREATE TABLE IF NOT EXISTS + индексы)
             cur.execute(DDL)
     logger.info("ml_tables_ready")
 
@@ -108,12 +146,13 @@ def finalize_run(run_id: int, n_machines: int, n_points: int,
             )
 
 
-def insert_anomalies(run_id: int, machine_id: str, scored) -> int:
+def insert_anomalies(run_id: int, machine_id: str, scored,
+                     machine_type: str = None, product_code: str = None) -> int:
     """scored — DataFrame из MachineDetector.score (index = event_time)."""
     if scored is None or scored.empty:
         return 0
     rows = [
-        (run_id, machine_id, idx.to_pydatetime(),
+        (run_id, machine_id, machine_type, product_code, idx.to_pydatetime(),
          float(r.score_ecod), float(r.score_iforest), bool(r.is_anomaly),
          str(r.top_sensor), float(r.top_sensor_z))
         for idx, r in scored.iterrows()
@@ -121,9 +160,10 @@ def insert_anomalies(run_id: int, machine_id: str, scored) -> int:
     with _pool.connection() as conn:
         with conn.cursor() as cur:
             cur.executemany(
-                "INSERT INTO ml_anomalies (run_id, machine_id, event_time, "
-                "score_ecod, score_iforest, is_anomaly, top_sensor, top_sensor_z) "
-                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+                "INSERT INTO ml_anomalies (run_id, machine_id, machine_type, "
+                "product_code, event_time, score_ecod, score_iforest, "
+                "is_anomaly, top_sensor, top_sensor_z) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                 rows,
             )
     return len(rows)
@@ -142,6 +182,14 @@ def insert_forecasts(run_id: int, machine_id: str, sensor: str, fc) -> int:
     ]
     with _pool.connection() as conn:
         with conn.cursor() as cur:
+            # Заменяем предыдущий прогноз этого ряда — в витрине нужен последний,
+            # а не накопление перекрывающихся ts от каждого прогона.
+            # Печь в любой момент в одной фазе, поэтому ключа (machine_id, sensor)
+            # достаточно даже для общего сенсора фаз (furnace_temp_zone1).
+            cur.execute(
+                "DELETE FROM ml_forecasts WHERE machine_id=%s AND sensor=%s",
+                (machine_id, sensor),
+            )
             cur.executemany(
                 "INSERT INTO ml_forecasts (run_id, machine_id, sensor, ts, "
                 "yhat, yhat_lower, yhat_upper, actual, breach) "
@@ -151,10 +199,53 @@ def insert_forecasts(run_id: int, machine_id: str, sensor: str, fc) -> int:
     return len(rows)
 
 
+def upsert_prophet_status(rows: list[tuple]) -> int:
+    """Перезаписывает статус Prophet по (machine_id, sensor).
+
+    rows — кортежи (machine_id, machine_type, context, sensor, is_anomaly,
+    n_breaches, horizon_points, lead_min, norm_lower, norm_upper, yhat_end).
+    """
+    if not rows:
+        return 0
+    with _pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.executemany(
+                "INSERT INTO ml_prophet_status (machine_id, machine_type, context, "
+                "sensor, is_anomaly, n_breaches, horizon_points, lead_min, "
+                "norm_lower, norm_upper, yhat_end, updated_at) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, now()) "
+                "ON CONFLICT (machine_id, sensor) DO UPDATE SET "
+                "machine_type=EXCLUDED.machine_type, context=EXCLUDED.context, "
+                "is_anomaly=EXCLUDED.is_anomaly, n_breaches=EXCLUDED.n_breaches, "
+                "horizon_points=EXCLUDED.horizon_points, lead_min=EXCLUDED.lead_min, "
+                "norm_lower=EXCLUDED.norm_lower, norm_upper=EXCLUDED.norm_upper, "
+                "yhat_end=EXCLUDED.yhat_end, updated_at=now()",
+                rows,
+            )
+    return len(rows)
+
+
+def prune_prophet_status(max_age_sec: float) -> int:
+    """Удаляет строки витрины Prophet, не обновлявшиеся дольше max_age_sec.
+
+    Так карточка станка, который встал или сменил фазу (и больше не пишет этот
+    сенсор), перестаёт «застревать» с прошлым статусом.
+    """
+    with _pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM ml_prophet_status "
+                "WHERE updated_at < now() - make_interval(secs => %s)",
+                (max_age_sec,),
+            )
+            return cur.rowcount
+
+
 def truncate_all() -> None:
     with _pool.connection() as conn:
         with conn.cursor() as cur:
             cur.execute("TRUNCATE ml_anomalies, ml_forecasts, ml_runs RESTART IDENTITY CASCADE")
+            cur.execute("TRUNCATE ml_prophet_status")
     logger.info("ml_tables_truncated")
 
 

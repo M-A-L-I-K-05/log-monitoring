@@ -130,6 +130,7 @@ class SensorReading(BaseModel):
     machine_id: str
     machine_type: str
     work_center: str
+    product_code: str | None = None
     readings: dict[str, float]
     event_time: datetime
 
@@ -282,6 +283,7 @@ def sensor_reading(data: SensorReading):
             "details": {
                 "machine_type": data.machine_type,
                 "work_center": data.work_center,
+                "product_code": data.product_code,
                 "readings": data.readings,
             },
         },
@@ -304,6 +306,7 @@ def sensor_reading_batch(batch: list[SensorReading]):
                 "details": {
                     "machine_type": data.machine_type,
                     "work_center": data.work_center,
+                    "product_code": data.product_code,
                     "readings": data.readings,
                 },
             },

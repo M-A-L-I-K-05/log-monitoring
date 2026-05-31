@@ -58,10 +58,10 @@ class _Background:
     def __init__(self):
         self.enabled = config.BACKGROUND_ENABLED
         self.interval = config.BACKGROUND_INTERVAL_SEC
-        self.retrain_enabled = config.BACKGROUND_RETRAIN_ENABLED
+        self.prophet_enabled = config.PROPHET_BACKGROUND_ENABLED
+        self._tick = 0
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
-        self._runs_since_train = 0
 
     def start(self):
         if self._thread and self._thread.is_alive():
@@ -70,20 +70,32 @@ class _Background:
         self._thread = threading.Thread(target=self._loop, daemon=True, name="ml-bg")
         self._thread.start()
 
+    @property
+    def lookback_min(self) -> float:
+        """Окно Loki для скоринга = интервал фона + запас, в реальных минутах.
+        Следует за текущим интервалом, поэтому смена интервала меняет и окно."""
+        return (self.interval + config.SCORING_MARGIN_SEC) / 60.0
+
+    @property
+    def prophet_every(self) -> int:
+        """Сколько тиков фона приходится на один прогнозный цикл Prophet.
+        Цель — раз в PROPHET_CYCLE_SEC секунд: при интервале 5с и цели 30с → 6."""
+        return max(1, round(config.PROPHET_CYCLE_SEC / self.interval))
+
     def _loop(self):
-        # дать стеку прогреться (Loki/симулятор могут ещё подниматься)
         self._stop.wait(10)
         while not self._stop.is_set():
             if self.enabled:
+                self._tick += 1
                 try:
-                    if self.retrain_enabled and (
-                            not pipeline.detectors or
-                            self._runs_since_train >= config.RETRAIN_EVERY_RUNS):
-                        pipeline.train(tag="auto-retrain")
-                        self._runs_since_train = 0
                     if pipeline.detectors:
-                        pipeline.run_once()
-                        self._runs_since_train += 1
+                        # детекция — каждый тик; авто-forecast здесь выключен,
+                        # прогноз ведёт отдельный prophet-контур ниже.
+                        pipeline.run_once(do_forecast=False,
+                                          lookback_min=self.lookback_min)
+                        # прогнозный цикл — реже, по счётчику
+                        if self.prophet_enabled and self._tick % self.prophet_every == 0:
+                            pipeline.run_prophet_cycle(lookback_min=self.lookback_min)
                     else:
                         logger.info("background_idle", extra={"details": {
                             "reason": "нет активной обученной модели"}})
@@ -97,7 +109,10 @@ class _Background:
 
     def state(self) -> dict:
         return {"enabled": self.enabled, "interval_sec": self.interval,
-                "retrain_enabled": self.retrain_enabled}
+                "lookback_sec": round(self.interval + config.SCORING_MARGIN_SEC, 2),
+                "prophet_enabled": self.prophet_enabled,
+                "prophet_every": self.prophet_every,
+                "prophet_cycle_sec": round(self.prophet_every * self.interval, 1)}
 
 
 bg = _Background()
@@ -128,21 +143,21 @@ if os.path.isdir(WEBUI_DIR):
 
 # ─── модели запросов ─────────────────────────────────────────
 class RunRequest(BaseModel):
-    real_lookback_min: float | None = None
     forecast: bool | None = None
 
 
 class TrainRequest(BaseModel):
-    real_lookback_min: float | None = None
     contamination: float | None = None
     tag: str | None = None
-    machine_ids: list[str] | None = None
 
 
 class LoopRequest(BaseModel):
     enabled: bool | None = None
     interval_sec: float | None = None
-    retrain_enabled: bool | None = None
+
+
+class ProphetLoopRequest(BaseModel):
+    enabled: bool | None = None
 
 
 class VersionRequest(BaseModel):
@@ -165,8 +180,7 @@ def status():
 # ─── endpoints: обучение и версии весов ──────────────────────
 @app.post("/train")
 def train(req: TrainRequest):
-    return pipeline.train(req.real_lookback_min, contamination=req.contamination,
-                          tag=req.tag, machine_ids=req.machine_ids)
+    return pipeline.train(contamination=req.contamination, tag=req.tag)
 
 
 @app.get("/models")
@@ -182,6 +196,12 @@ def activate(req: VersionRequest):
         raise HTTPException(status_code=404, detail=str(exc))
 
 
+@app.delete("/models")
+def delete_all_models():
+    """Удаляет ВСЕ сохранённые версии весов и снимает активную."""
+    return pipeline.delete_all_versions()
+
+
 @app.delete("/models/{version}")
 def delete_model(version: str):
     return pipeline.delete_version(version)
@@ -190,22 +210,22 @@ def delete_model(version: str):
 # ─── endpoints: скоринг ──────────────────────────────────────
 @app.post("/run-once")
 def run_once(req: RunRequest):
-    return pipeline.run_once(req.real_lookback_min, req.forecast)
+    return pipeline.run_once(req.forecast)
 
 
 @app.post("/detect")
 def detect(req: RunRequest):
-    return pipeline.run_once(req.real_lookback_min, do_forecast=False)
+    return pipeline.run_once(do_forecast=False)
 
 
 @app.post("/forecast")
 def forecast(req: RunRequest):
-    return pipeline.run_once(req.real_lookback_min, do_forecast=True)
+    return pipeline.run_once(do_forecast=True)
 
 
 @app.post("/evaluate")
-def evaluate(req: RunRequest):
-    return pipeline.evaluate(req.real_lookback_min)
+def evaluate():
+    return pipeline.evaluate()
 
 
 # ─── endpoints: режим и сброс ────────────────────────────────
@@ -213,12 +233,28 @@ def evaluate(req: RunRequest):
 def loop(req: LoopRequest):
     if req.enabled is not None:
         bg.enabled = req.enabled
-    if req.interval_sec:
-        bg.interval = req.interval_sec
-    if req.retrain_enabled is not None:
-        bg.retrain_enabled = req.retrain_enabled
+    if req.interval_sec is not None:
+        if req.interval_sec < 1:
+            raise HTTPException(status_code=400,
+                                detail="интервал должен быть ≥ 1 секунды")
+        bg.interval = float(req.interval_sec)
     logger.info("loop_toggled", extra={"details": bg.state()})
     return bg.state()
+
+
+@app.post("/prophet_loop")
+def prophet_loop(req: ProphetLoopRequest):
+    """Включает/выключает фоновый прогнозный контур Prophet (карточки Grafana)."""
+    if req.enabled is not None:
+        bg.prophet_enabled = req.enabled
+    logger.info("prophet_loop_toggled", extra={"details": bg.state()})
+    return bg.state()
+
+
+@app.post("/prophet_cycle")
+def prophet_cycle():
+    """Прогнать прогнозный цикл один раз вручную (для проверки/первого заполнения)."""
+    return pipeline.run_prophet_cycle(lookback_min=bg.lookback_min)
 
 
 @app.post("/reset")

@@ -80,9 +80,9 @@ def query_range(logql: str, start: datetime, end: datetime,
 
 def fetch_events(service: str, event: str,
                  real_lookback_min: float = None) -> list[dict]:
-    """Тянет записи конкретного события конкретного сервиса за недавнее окно."""
+    """Тянет записи конкретного события за недавнее реальное окно (для скоринга)."""
     real_lookback_min = real_lookback_min if real_lookback_min is not None \
-        else config.REAL_LOOKBACK_MIN
+        else config.SCORING_LOOKBACK_MIN
     end = datetime.now(timezone.utc)
     start = end - timedelta(minutes=real_lookback_min)
     logql = '{service_name="%s", event="%s"}' % (service, event)
@@ -90,6 +90,43 @@ def fetch_events(service: str, event: str,
     logger.info("loki_fetch", extra={"details": {
         "service": service, "event": event,
         "real_lookback_min": real_lookback_min, "records": len(records)}})
+    return records
+
+
+def fetch_for_machine(machine_id: str, product_code: str,
+                      limit: int = None) -> list[dict]:
+    """Последние N sensor_reading для конкретной (machine_id, product_code)."""
+    limit = limit or config.TRAIN_POINTS
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(days=config.LOKI_MAX_QUERY_DAYS)
+    logql = ('{service_name="%s", event="%s"}'
+             ' | json'
+             ' | entity_id="%s"'
+             % (config.SENSOR_SERVICE, config.SENSOR_EVENT, machine_id))
+    records = query_range(logql, start, end, limit=limit, max_lines=limit)
+    # фильтруем по product_code на стороне клиента (Loki не индексирует вложенный JSON)
+    filtered = [r for r in records
+                if (r.get("details") or {}).get("product_code") == product_code]
+    logger.info("loki_fetch_machine", extra={"details": {
+        "machine_id": machine_id, "product_code": product_code,
+        "fetched": len(records), "filtered": len(filtered)}})
+    return filtered
+
+
+def fetch_for_training() -> list[dict]:
+    """Последние TRAIN_FETCH_LIMIT sensor_reading для обучения.
+
+    Не использует временное окно — запрашивает просто последние N записей
+    с direction=backward. Работает при любой скорости симулятора.
+    """
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(days=config.LOKI_MAX_QUERY_DAYS)
+    logql = '{service_name="%s", event="%s"}' % (config.SENSOR_SERVICE, config.SENSOR_EVENT)
+    # limit НЕ задаём: размер страницы остаётся LOKI_PAGE_LIMIT (≤ потолка Loki
+    # max_entries_limit_per_query=5000). query_range наберёт TRAIN_FETCH_LIMIT
+    # за несколько страниц (direction=backward).
+    records = query_range(logql, start, end, max_lines=config.TRAIN_FETCH_LIMIT)
+    logger.info("loki_fetch_training", extra={"details": {"records": len(records)}})
     return records
 
 

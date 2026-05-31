@@ -16,14 +16,16 @@ DATABASE_URL = os.environ.get(
     "DATABASE_URL", "postgresql://admin:secret@postgres:5432/factory")
 
 # ─── Извлечение логов из Loki ──────────────────────────────────
-# ВАЖНО: Loki индексирует логи по РЕАЛЬНОМУ времени приёма (wall clock), а не
-# по виртуальному времени завода. Симулятор гоняет время ускоренно, поэтому
-# запрашиваем НЕДАВНЕЕ реальное окно, а ось времени ряда строим по полю
-# event_time из JSON (виртуальное время). См. loki_client / features.
-REAL_LOOKBACK_MIN = _f("ML_REAL_LOOKBACK_MIN", "30")   # сколько реальных минут тянуть
-MAX_LOG_LINES = _i("ML_MAX_LOG_LINES", "300000")        # потолок строк за запрос
-LOKI_PAGE_LIMIT = _i("ML_LOKI_PAGE_LIMIT", "5000")      # max entries на страницу Loki
+MAX_LOG_LINES = _i("ML_MAX_LOG_LINES", "300000")
+LOKI_PAGE_LIMIT = _i("ML_LOKI_PAGE_LIMIT", "5000")
 LOKI_TIMEOUT_SEC = _f("ML_LOKI_TIMEOUT_SEC", "30")
+# Loki ограничивает ДЛИНУ диапазона запроса (max_query_length, по умолчанию ~30д).
+# «Последние N записей» берём за это окно реального времени — данные пишутся в
+# Loki в реальном времени, поэтому свежий сбор всегда попадает в окно.
+LOKI_MAX_QUERY_DAYS = _i("ML_LOKI_MAX_QUERY_DAYS", "29")
+# Обучение: запрашиваем последние TRAIN_FETCH_LIMIT строк (direction=backward,
+# без временного окна — работает при любой скорости симулятора).
+TRAIN_FETCH_LIMIT = _i("ML_TRAIN_FETCH_LIMIT", "90000")
 
 # Метки потоков (см. promtail-config.yaml: relabel → service_name, labels → event/level).
 SENSOR_SERVICE = "equipment"
@@ -33,32 +35,80 @@ SCENARIO_EVENT = "scenario_event"     # разметка для /evaluate
 ALARM_EVENT = "alarm"
 
 # ─── Подготовка фичей ──────────────────────────────────────────
-RESAMPLE_RULE = os.environ.get("ML_RESAMPLE", "1min")   # шаг ресемпла виртуального ряда
-MIN_TRAIN_POINTS = _i("ML_MIN_TRAIN_POINTS", "30")      # минимум точек для fit
+# Демпинг шума: усредняем 4 показания по 15с в одну минуту → σ шума падает вдвое (√4).
+# Переобучение НЕ требуется, и это намеренно: train_mean инвариантен к усреднению
+# (среднее минутных средних = среднее 15с), а train_std остаётся 15-секундным.
+# Минутные средние «тихие» (σ/2), но меряются «громкой» 15с-нормой → z шума ≈ вдвое
+# меньше, хвосты не доходят до ANOMALY_Z. Дрейф сценария (сдвиг среднего) усреднение
+# сохраняет → z_дрейф = Δ/σ₁₅ как был, ловится. ECOD/IForest калиброваны на 15с-
+# разбросе, на минутных средних почти молчат — ок, они вспомогательные (по ИЛИ).
+RESAMPLE_RULE = os.environ.get("ML_RESAMPLE", "1min")
+MIN_TRAIN_POINTS = _i("ML_MIN_TRAIN_POINTS", "30")       # алгоритмический минимум внутри fit
+TRAIN_POINTS = _i("ML_TRAIN_POINTS", "1000")             # нужно на комбинацию (machine_type, product_code)
 
-# Главные сенсоры для Prophet-прогноза по типу станка (ключевые для сценариев).
-# Detection (ECOD/IForest) использует ВСЕ сенсоры станка; forecast — только эти.
+# Главные сенсоры для Prophet-прогноза.
+# Для обычных станков ключ = machine_type.
+# Для печи ключ = "furnace__<phase>" — у каждой фазы свои аномальные сенсоры.
+# Detection (ECOD/IForest) использует ВСЕ сенсоры; forecast — только эти.
 MAIN_SENSORS = {
-    "turning":  ["vibration_rms_mm_s", "spindle_load_percent", "spindle_bearing_temp"],
-    "hobbing":  ["vibration_rms_mm_s", "spindle_load_percent", "hob_bearing_temp"],
-    "shaving":  ["vibration_rms_mm_s", "spindle_load_percent"],
-    "grinding": ["vibration_rms_mm_s", "wheel_bearing_temp", "coolant_flow", "spindle_power_kw"],
-    "furnace":  ["carbon_potential", "furnace_temp_zone1"],
+    # ── По типу станка (применяется для всех шестерён если нет конкретного ключа) ──
+    "turning":              ["vibration_rms_mm_s", "spindle_load_percent", "spindle_bearing_temp"],
+    "hobbing":              ["vibration_rms_mm_s", "spindle_load_percent", "hob_bearing_temp"],
+    "shaving":              ["vibration_rms_mm_s", "spindle_load_percent"],
+    "grinding":             ["vibration_rms_mm_s", "wheel_bearing_temp", "coolant_flow", "spindle_power_kw"],
+    # ── Печь: по фазе ─────────────────────────────────────────────────────────────
+    "furnace__carburizing": ["carbon_potential", "furnace_temp_zone1"],
+    "furnace__quenching":   ["quench_oil_temp", "quench_oil_flow", "furnace_temp_zone1"],
+    # ── Переопределения по (тип станка, тип шестерни) — если нужен другой набор ──
+    # Пример: "turning__HEL-L": ["vibration_rms_mm_s", "spindle_bearing_temp"]
+    # Если ключ отсутствует — используется общий ключ типа станка выше.
 }
-# Типы станков, у которых нет «аномальных» сенсоров (инспекция) — пропускаем.
+# Типы станков, у которых нет «аномальных» сенсоров — пропускаем.
 SKIP_MACHINE_TYPES = {"inspection"}
+# Для печи обучаем модели только для аномальных фаз.
+FURNACE_ML_PHASES = {"carburizing", "quenching"}
 
 # ─── Детекторы аномалий (PyOD) ─────────────────────────────────
-CONTAMINATION = _f("ML_CONTAMINATION", "0.02")          # ожидаемая доля аномалий
+CONTAMINATION = _f("ML_CONTAMINATION", "0.02")          # используется только для fit
 IFOREST_RANDOM_STATE = _i("ML_IFOREST_SEED", "42")
-# Как комбинировать ECOD и IForest: "any" (хотя бы один) | "both" (оба согласны).
+# ECOD/IForest — вспомогательный МНОГОМЕРНЫЙ сигнал («несколько сенсоров странны
+# вместе»), добавляется к главному z-правилу по ИЛИ. "any" — хотя бы один детектор,
+# "both" — оба. Главный триггер всё равно z-правило ниже; детекторы только докидывают
+# аномалии-комбинации, которых z по одному сенсору не видит.
 ANOMALY_COMBINE = os.environ.get("ML_COMBINE", "any")
+# После fit порог автоматически поднимается до mean + N*std обучающих scores.
+# 3.0 → ~0.1% ложных на чистом гауссовом baseline. 0 → оставить порог от contamination.
+THRESHOLD_SIGMA = _f("ML_THRESHOLD_SIGMA", "3.0")
+
+# z-правило (ГЛАВНЫЙ триггер): аномалия, если ЛЮБОЙ сенсор вышел за ANOMALY_Z σ
+# обучающей нормы (берём максимум по сенсорам). Это та же σ, что в симуляторе
+# (z = (x-mean)/std). 2.8 — чуть ниже 3σ отбраковки, т.е. ловим в зоне раннего
+# предупреждения, до брака. Соединяется с ECOD/IForest по ИЛИ. 0 → выключить.
+ANOMALY_Z = _f("ML_ANOMALY_Z", "2.8")
+# Персистентность (SPC run-rule): аномалию пишем, только если кандидат держится
+# PERSIST_N показаний ПОДРЯД. Одиночные шумовые хвосты гаусса так отсекаются,
+# а устойчивый дрейф (сдвиг среднего) проходит. 1 → выключить (писать одиночные).
+PERSIST_N = _i("ML_PERSIST_N", "3")
 
 # ─── Forecasting (Prophet) ─────────────────────────────────────
 PROPHET_INTERVAL_WIDTH = _f("ML_PROPHET_INTERVAL", "0.99")
 FORECAST_HORIZON_MIN = _i("ML_FORECAST_HORIZON_MIN", "30")
 # Прогноз тяжелее детекции (Prophet fit на ряд) — в фоне делаем реже.
 FORECAST_EVERY_RUNS = _i("ML_FORECAST_EVERY_RUNS", "5")
+# Сколько последних показаний тянуть из Loki под каждый Prophet-ряд.
+# Это СОБСТВЕННОЕ окно прогноза (не скоринговое): Prophet нужен длинный ряд,
+# поэтому запрашиваем напрямую N последних точек по (машина, шестерня/фаза).
+PROPHET_FETCH_POINTS = _i("ML_PROPHET_FETCH_POINTS", "800")
+# Прогнозный контур (отдельный от детекции): включается тумблером в WebUI.
+# Цель периодичности — раз в PROPHET_CYCLE_SEC секунд; фон сам считает счётчик
+# тиков (PROPHET_CYCLE_SEC / интервал фона), напр. 30/5 = каждые 6 тиков.
+PROPHET_BACKGROUND_ENABLED = os.environ.get(
+    "ML_PROPHET_BACKGROUND_ENABLED", "false").lower() == "true"
+PROPHET_CYCLE_SEC = _f("ML_PROPHET_CYCLE_SEC", "30")
+# Время жизни строки витрины ml_prophet_status: если станок/сенсор не обновлялся
+# дольше — строку выбрасываем (станок встал, сменил фазу печи на сенсоры другой
+# фазы и т.п.), чтобы карточки Grafana не показывали застрявший статус.
+PROPHET_STATUS_TTL_SEC = _f("ML_PROPHET_STATUS_TTL_SEC", "300")
 
 # ─── Хранение весов на диске (volume) ──────────────────────────
 # Веса детекторов сохраняются как версии в MODELS_DIR (монтируется как
@@ -68,13 +118,15 @@ MODELS_DIR = os.environ.get("ML_MODELS_DIR", "/app/models")
 
 # ─── Фоновый поток ─────────────────────────────────────────────
 BACKGROUND_ENABLED = os.environ.get("ML_BACKGROUND_ENABLED", "true").lower() == "true"
-BACKGROUND_INTERVAL_SEC = _f("ML_BACKGROUND_INTERVAL_SEC", "120")
-# По умолчанию фон ТОЛЬКО скорит по сохранённым весам и НЕ переобучает —
-# веса замораживаются обучением на чистом baseline. Авто-переобучение можно
-# включить тумблером (на случай дрейфа парка): retrain каждые N прогонов.
-BACKGROUND_RETRAIN_ENABLED = os.environ.get(
-    "ML_BACKGROUND_RETRAIN_ENABLED", "false").lower() == "true"
-RETRAIN_EVERY_RUNS = _i("ML_RETRAIN_EVERY_RUNS", "10")
+BACKGROUND_INTERVAL_SEC = _f("ML_BACKGROUND_INTERVAL_SEC", "5")
+# Запас окна скоринга поверх интервала фона (реальные секунды). Окно Loki =
+# интервал + запас, чтобы соседние прогоны перекрывались и не теряли точки на
+# стыке. Считается ДИНАМИЧЕСКИ от текущего интервала фона (см. main._Background).
+SCORING_MARGIN_SEC = _f("ML_SCORING_MARGIN_SEC", "5")
+# Дефолтное окно скоринга для ручных вызовов (/detect и т.п.), в реальных минутах:
+# интервал + запас. Фоновый поток пересчитывает своё окно сам при смене интервала.
+SCORING_LOOKBACK_MIN = _f("ML_SCORING_LOOKBACK_MIN",
+                           str(round((BACKGROUND_INTERVAL_SEC + SCORING_MARGIN_SEC) / 60, 4)))
 
 # ─── Оценка качества (/evaluate) ───────────────────────────────
 # Допуск по времени при сопоставлении аномалии с окном сценария (виртуальные минуты).

@@ -1,13 +1,15 @@
 """Оркестрация ML-пайплайна: Loki → features → ECOD/IForest + Prophet → Postgres.
 
-Веса детекторов ЗАМОРОЖЕНЫ: обучаются явно (train) на чистом baseline и
-сохраняются на диск как версия (model_store). Скоринг (run_once / evaluate)
-идёт только по уже обученным станкам — без авто-фита на лету. Это даёт
-воспроизводимость и снимает переобучение с каждого прогона.
+Модели строятся по (machine_type, product_code), а не по machine_id —
+сенсорные данные зависят от типа станка и типа шестерни, не от конкретной машины.
+
+Обучение: явное (train), на последних TRAIN_FETCH_LIMIT записях из Loki.
+Скоринг: инкрементальный (run_once), окно = SCORING_LOOKBACK_MIN реальных минут.
 """
 import logging
 import threading
 
+import numpy as np
 import pandas as pd
 
 import config
@@ -20,6 +22,12 @@ from detectors import MachineDetector
 
 logger = logging.getLogger("ml.pipeline")
 
+_DET_KEY_SEP = "__"
+
+
+def _det_key(machine_type: str, product_code: str) -> str:
+    return f"{machine_type}{_DET_KEY_SEP}{product_code}"
+
 
 class Pipeline:
     def __init__(self):
@@ -27,18 +35,25 @@ class Pipeline:
         self.active_version: str | None = None
         self.run_count = 0
         self.last_summary: dict | None = None
+        # Последнее записанное виртуальное время по (machine_id, product_code) —
+        # для дедупа: окна скоринга перекрываются, пишем только точки новее.
+        self._last_seen: dict[tuple, pd.Timestamp] = {}
+        # Счётчик персистентности по (machine_id, product_code): для КАЖДОГО
+        # «горячего» канала (сенсор или ECOD/IForest) — сколько точек подряд он
+        # горяч. {key: {channel: count}}. Переживает батчи, поэтому серия
+        # считается через границы прогонов.
+        self._persist_count: dict[tuple, dict[str, int]] = {}
         self._lock = threading.Lock()
         self._load_active_on_start()
 
     def _load_active_on_start(self):
-        """Поднять активную версию весов с диска (если есть)."""
         try:
             version = model_store.get_active()
             if version:
                 self.detectors = model_store.load_version(version)
                 self.active_version = version
                 logger.info("active_models_loaded", extra={"details": {
-                    "version": version, "machines": sorted(self.detectors)}})
+                    "version": version, "keys": sorted(self.detectors)}})
             else:
                 logger.info("no_active_models",
                             extra={"details": {"hint": "обучите модель через /train"}})
@@ -46,83 +61,86 @@ class Pipeline:
             logger.error("active_models_load_failed",
                          extra={"details": {"error": str(exc)}})
 
-    # ─── извлечение ──────────────────────────────────────────
-    def _pull_frames(self, real_lookback_min=None):
-        records = loki_client.fetch_events(
-            config.SENSOR_SERVICE, config.SENSOR_EVENT, real_lookback_min)
-        long_df = features.records_to_long(records)
-        frames = features.machine_frames(long_df)
-        return frames
+    # ─── обучение ────────────────────────────────────────────────
+    def train(self, contamination=None, tag=None) -> dict:
+        """Обучает детекторы по (machine_type, product_code).
 
-    @staticmethod
-    def _window_bounds(frames):
-        lo = hi = None
-        for _mid, (_mt, wide) in frames.items():
-            if wide.empty:
-                continue
-            f, t = wide.index.min(), wide.index.max()
-            lo = f if lo is None or f < lo else lo
-            hi = t if hi is None or t > hi else hi
-        to_dt = lambda x: x.to_pydatetime() if x is not None else None
-        return to_dt(lo), to_dt(hi)
-
-    # ─── обучение детекторов (→ сохранение версии на диск) ────
-    def train(self, real_lookback_min=None, contamination=None,
-              tag=None, machine_ids=None) -> dict:
-        """Обучает детекторы на текущем окне нормальных данных и сохраняет
-        результат как новую ВЕРСИЮ весов на диск, делая её активной.
-
-        contamination — переопределяет долю аномалий для этого обучения.
-        machine_ids   — обучить только указанные станки (None = все).
-        tag           — человекочитаемая пометка версии (напр. "baseline-month").
+        Запрашивает последние TRAIN_FETCH_LIMIT записей из Loki.
+        Каждая комбинация должна иметь ≥ TRAIN_POINTS точек — иначе пропускается
+        с сообщением пользователю.
         """
         with self._lock:
-            frames = self._pull_frames(real_lookback_min)
-            want = set(machine_ids) if machine_ids else None
-            fitted, skipped = [], []
-            new_detectors: dict[str, MachineDetector] = {}
-            for mid, (mt, wide) in frames.items():
-                if want is not None and mid not in want:
-                    continue
-                det = MachineDetector(mid, contamination=contamination)
-                if det.fit(wide, machine_type=mt):
-                    new_detectors[mid] = det
-                    fitted.append(mid)
-                else:
-                    skipped.append(mid)
+            records = loki_client.fetch_for_training()
+            long_df = features.records_to_long(records)
+            tp_frames = features.type_product_frames(long_df)
 
-            wf, wt = self._window_bounds(frames)
+            trained, skipped, insufficient = [], [], []
+            new_detectors: dict[str, MachineDetector] = {}
+
+            for (mtype, pcode), (n_points, wide) in tp_frames.items():
+                key = _det_key(mtype, pcode)
+                if n_points < config.TRAIN_POINTS:
+                    insufficient.append({
+                        "key": key, "points": n_points,
+                        "needed": config.TRAIN_POINTS})
+                    skipped.append(key)
+                    continue
+                det = MachineDetector(key, contamination=contamination)
+                if det.fit(wide, machine_type=mtype):
+                    new_detectors[key] = det
+                    trained.append({"key": key, "points": n_points})
+                else:
+                    skipped.append(key)
+
             manifest = None
             if new_detectors:
                 manifest = model_store.save_version(
                     new_detectors, tag=tag, make_active=True,
-                    extra={"window_from": wf.isoformat() if wf else None,
-                           "window_to": wt.isoformat() if wt else None,
-                           "real_lookback_min": real_lookback_min
-                           or config.REAL_LOOKBACK_MIN})
+                    extra={"contamination": contamination or config.CONTAMINATION,
+                           "train_points_required": config.TRAIN_POINTS})
                 self.detectors = new_detectors
                 self.active_version = manifest["version"]
 
-            run_id = store.new_run("train", wf, wt, {
-                "fitted": fitted, "skipped": skipped,
+            run_id = store.new_run("train", None, None, {
+                "trained": [t["key"] for t in trained],
+                "skipped": skipped,
+                "version": self.active_version})
+            store.finalize_run(run_id, len(trained), 0, 0, 0)
+
+            summary = {
+                "run_id": run_id,
+                "trained": trained,
+                "skipped": skipped,
+                "insufficient": insufficient,
                 "version": self.active_version,
-                "contamination": contamination or config.CONTAMINATION})
-            store.finalize_run(run_id, len(fitted), 0, 0, 0)
-            summary = {"run_id": run_id, "fitted": fitted, "skipped": skipped,
-                       "machines": len(frames),
-                       "version": self.active_version,
-                       "saved": manifest is not None}
+                "saved": manifest is not None,
+            }
+            if insufficient:
+                summary["message"] = (
+                    "Недостаточно данных для некоторых комбинаций. "
+                    f"Нужно ≥ {config.TRAIN_POINTS} точек. "
+                    "Прогоните симулятор ещё немного и повторите обучение."
+                )
             logger.info("train_done", extra={"details": summary})
             return summary
 
-    # ─── полный прогон (скоринг по замороженным весам) ───────
-    def run_once(self, real_lookback_min=None, do_forecast=None) -> dict:
+    # ─── скоринг ─────────────────────────────────────────────────
+    def run_once(self, do_forecast=None, lookback_min=None) -> dict:
+        """Инкрементальный скоринг за последние lookback_min реальных минут.
+
+        lookback_min задаёт фоновый поток как (интервал + запас); при ручном
+        вызове None → fetch_events берёт дефолт config.SCORING_LOOKBACK_MIN.
+        """
         with self._lock:
             self.run_count += 1
             if do_forecast is None:
                 do_forecast = (self.run_count % config.FORECAST_EVERY_RUNS == 1)
 
-            frames = self._pull_frames(real_lookback_min)
+            records = loki_client.fetch_events(
+                config.SENSOR_SERVICE, config.SENSOR_EVENT, lookback_min)
+            long_df = features.records_to_long(records)
+            frames = features.machine_frames(long_df)
+
             wf, wt = self._window_bounds(frames)
             run_id = store.new_run("run", wf, wt,
                                    {"do_forecast": bool(do_forecast),
@@ -130,48 +148,240 @@ class Pipeline:
                                     "version": self.active_version})
 
             n_points = n_anom = n_fc = 0
-            detected_per_machine = {}
+            detected_per_key = {}
             untrained = []
-            for mid, (mt, wide) in frames.items():
-                det = self.detectors.get(mid)
+
+            for (mid, pcode), (mtype, wide) in frames.items():
+                key = _det_key(mtype, pcode) if pcode else None
+                det = self.detectors.get(key) if key else None
                 if det is None or not det.fitted:
-                    untrained.append(mid)      # без обученной модели не скорим
+                    untrained.append(f"{mid}({mtype}/{pcode})")
                     continue
+
                 scored = det.score(wide)
                 if scored is None:
                     continue
+
+                # Дедуп по виртуальному времени: окна скоринга перекрываются,
+                # поэтому пишем только точки новее последней записанной — иначе
+                # одни и те же аномалии добавлялись бы в БД каждый прогон.
+                last = self._last_seen.get((mid, pcode))
+                if last is not None:
+                    scored = scored[scored.index > last]
+                if scored.empty:
+                    continue
+                self._last_seen[(mid, pcode)] = scored.index.max()
+
+                # Персистентность: кандидат → аномалия только после PERSIST_N подряд.
+                scored = self._apply_persistence((mid, pcode), scored)
+
                 n_points += len(scored)
-                store.insert_anomalies(run_id, mid, scored)
+                store.insert_anomalies(run_id, mid, scored,
+                                       machine_type=mtype, product_code=pcode)
                 anom = int(scored["is_anomaly"].sum())
                 n_anom += anom
-                detected_per_machine[mid] = anom
+                detected_per_key[f"{mid}/{pcode}"] = anom
 
-                if do_forecast:
-                    for sensor, ser in features.main_series(mt, wide).items():
-                        fc = forecaster.forecast_series(ser)
-                        n_fc += store.insert_forecasts(run_id, mid, sensor, fc)
+                if do_forecast and pcode:
+                    n_fc += self._run_prophet(run_id, mid, mtype, pcode)
 
-            store.finalize_run(run_id, len(detected_per_machine),
+            store.finalize_run(run_id, len(detected_per_key),
                                n_points, n_anom, n_fc)
             summary = {
                 "run_id": run_id,
-                "scored_machines": len(detected_per_machine),
-                "untrained_machines": untrained,
-                "points": n_points, "anomalies": n_anom, "forecasts": n_fc,
+                "scored": len(detected_per_key),
+                "untrained": untrained,
+                "points": n_points,
+                "anomalies": n_anom,
+                "forecasts": n_fc,
                 "forecast_done": bool(do_forecast),
                 "version": self.active_version,
-                "window": [wf.isoformat() if wf else None,
-                           wt.isoformat() if wt else None],
-                "by_machine": detected_per_machine,
+                "by_machine": detected_per_key,
             }
             self.last_summary = summary
             logger.info("run_done", extra={"details": summary})
             return summary
 
-    # ─── оценка качества по разметке сценариев ───────────────
+    def _apply_persistence(self, key: tuple, scored: pd.DataFrame) -> pd.DataFrame:
+        """SPC run-rule ПО-КАНАЛЬНО: аномалия, когда ХОТЯ БЫ ОДИН «горячий» канал
+        (сенсор за порогом или ECOD/IForest) держится PERSIST_N точек ПОДРЯД.
+
+        Считаем серию отдельно по каждому каналу: горяч в этой точке → +1, иначе
+        канал сбрасывается в 0. Так шум, перепрыгивающий между разными сенсорами
+        (каждый раз вылетает другой из 6–8), не копит серию — а устойчивый дрейф
+        одного сенсора копит. Счётчик по key переживает батчи (серия считается
+        через границы прогонов). scored отсортирован по виртуальному времени.
+        """
+        n = config.PERSIST_N
+        if n <= 1:
+            return scored
+        counts = self._persist_count.get(key, {})
+        flags = []
+        for hot in scored["hot"].tolist():
+            # инкрементируем только горячие каналы; отсутствующие = сброс в 0
+            counts = {ch: counts.get(ch, 0) + 1 for ch in hot}
+            flags.append(any(c >= n for c in counts.values()))
+        self._persist_count[key] = counts
+        scored["is_anomaly"] = flags
+        return scored
+
+    # ─── прогноз (predictive) ────────────────────────────────────
+    def _run_prophet(self, run_id: int, mid: str, mtype: str, pcode: str) -> int:
+        """Предиктивная аналитика по (machine_id, product_code/фаза).
+
+        Тянет СОБСТВЕННОЕ окно из Loki — последние PROPHET_FETCH_POINTS показаний
+        этой машины с нужной шестернёй (для печи — нужной фазы), независимо от
+        скорингового окна: Prophet нужен длинный ряд. Один запрос на станок,
+        дальше прогноз по каждому главному сенсору → ml_forecasts.
+        breach = выход реального значения за доверительный интервал = ранний
+        предиктивный сигнал (ещё до alarm).
+        """
+        if not forecaster.available():
+            return 0
+        # для печи product_code в логах пустой — фильтруем по фазе уже после pivot
+        pc_filter = None if mtype == "furnace" else pcode
+        records = loki_client.fetch_for_machine(
+            mid, pc_filter, limit=config.PROPHET_FETCH_POINTS)
+        long_df = features.records_to_long(records)
+        if long_df.empty:
+            return 0
+        wide = long_df.pivot_table(index="event_time", columns="sensor",
+                                   values="value", aggfunc="mean").sort_index()
+        if mtype == "furnace":
+            wide = features.filter_furnace_phase(wide, pcode)
+        wide = wide.resample(config.RESAMPLE_RULE).mean().ffill().dropna(how="all")
+        if wide.empty:
+            return 0
+
+        n = 0
+        for sensor, ser in features.main_series(
+                mtype, wide, product_code=pcode).items():
+            fc = forecaster.forecast_series(ser)
+            if fc is None:
+                continue
+            n += store.insert_forecasts(run_id, mid, sensor, fc)
+        return n
+
+    # ─── предиктивный контур Prophet (отдельный от детекции) ─────
+    def run_prophet_cycle(self, lookback_min=None) -> dict:
+        """Прогнозный цикл: для активных станков предсказываем главные сенсоры на
+        горизонт и проверяем, не уйдёт ли прогноз за норму.
+
+        1) по свежему окну находим активные станки и их текущий контекст
+           (тип шестерни / фаза печи);
+        2) для каждого станка × главный сенсор обучаем Prophet на своём длинном
+           окне (PROPHET_FETCH_POINTS) и берём прогноз на FORECAST_HORIZON_MIN;
+        3) аномалия = yhat на горизонте выходит за норму сенсора (train_mean ±
+           ANOMALY_Z·σ из ОБУЧЕННОГО детектора этой комбинации — модели не меняем,
+           только читаем их норму);
+        4) пишем витрину ml_prophet_status для карточек Grafana.
+
+        Контур независим от детекции (run_once) — детекторы и их веса не трогаются.
+        """
+        if not forecaster.available():
+            return {"prophet": "unavailable"}
+        with self._lock:
+            records = loki_client.fetch_events(
+                config.SENSOR_SERVICE, config.SENSOR_EVENT, lookback_min)
+            long_df = features.records_to_long(records)
+            frames = features.machine_frames(long_df)   # активные (mid, context)
+
+            rows = []
+            machines = anomalies = 0
+            checked, no_norm = [], []
+            for (mid, ctx), (mtype, _wide) in frames.items():
+                det = self.detectors.get(_det_key(mtype, ctx))
+                if det is None or not det.fitted:
+                    no_norm.append(f"{mid}({mtype}/{ctx})")
+                    continue
+                sensors = self._prophet_sensors(mtype, ctx, det)
+                if not sensors:
+                    continue
+
+                pc_filter = None if mtype == "furnace" else ctx
+                mrecords = loki_client.fetch_for_machine(
+                    mid, pc_filter, limit=config.PROPHET_FETCH_POINTS)
+                mlong = features.records_to_long(mrecords)
+                if mlong.empty:
+                    continue
+                wide = mlong.pivot_table(index="event_time", columns="sensor",
+                                         values="value", aggfunc="mean").sort_index()
+                if mtype == "furnace":
+                    wide = features.filter_furnace_phase(wide, ctx)
+                wide = wide.resample(config.RESAMPLE_RULE).mean().ffill().dropna(how="all")
+                if wide.empty:
+                    continue
+
+                machines += 1
+                for sensor in sensors:
+                    row = self._prophet_check_sensor(mid, mtype, ctx, det, wide, sensor)
+                    if row is None:
+                        continue
+                    rows.append(row)
+                    checked.append(f"{mid}/{sensor}")
+                    if row[4]:          # is_anomaly
+                        anomalies += 1
+
+            store.upsert_prophet_status(rows)
+            # Чистим застрявшие строки (станок встал / сменил фазу печи), чтобы
+            # карточки Grafana не показывали статус из прошлого.
+            pruned = store.prune_prophet_status(config.PROPHET_STATUS_TTL_SEC)
+            summary = {"prophet_cycle": True, "machines": machines,
+                       "sensors_checked": len(rows), "anomalies": anomalies,
+                       "pruned": pruned, "no_norm": no_norm, "checked": checked}
+            logger.info("prophet_cycle_done", extra={"details": summary})
+            return summary
+
+    def _prophet_sensors(self, mtype: str, ctx: str, det) -> list[str]:
+        """Главные сенсоры комбинации, по которым есть норма в детекторе."""
+        key = f"{mtype}__{ctx}"
+        wanted = config.MAIN_SENSORS.get(key) or config.MAIN_SENSORS.get(mtype, [])
+        cols = set(det.columns or [])
+        return [s for s in wanted if s in cols]
+
+    def _prophet_check_sensor(self, mid, mtype, ctx, det, wide, sensor):
+        """Прогноз одного сенсора + проверка выхода за норму. Возвращает кортеж
+        для store.upsert_prophet_status или None, если прогноз не построить."""
+        if sensor not in wide.columns:
+            return None
+        ser = wide[sensor].dropna()
+        if len(ser) < config.MIN_TRAIN_POINTS:
+            return None
+        fc = forecaster.forecast_series(ser, config.FORECAST_HORIZON_MIN)
+        if fc is None:
+            return None
+        try:
+            mean = float(det.train_mean[sensor])
+            std = float(det.train_std[sensor])
+        except (KeyError, TypeError, ValueError):
+            return None
+        if not np.isfinite(std) or std <= 0:
+            return None
+
+        lower = mean - config.ANOMALY_Z * std
+        upper = mean + config.ANOMALY_Z * std
+        future = fc[fc["actual"].isna()]      # только горизонт (без in-sample)
+        if future.empty:
+            return None
+        over = (future["yhat"] < lower) | (future["yhat"] > upper)
+        n_breaches = int(over.sum())
+        is_anom = n_breaches > 0
+        lead_min = None
+        if is_anom:
+            now_v = fc.loc[fc["actual"].notna(), "ts"].max()
+            first_ts = future.loc[over, "ts"].min()
+            lead_min = round((first_ts - now_v).total_seconds() / 60.0, 1)
+        return (mid, mtype, ctx, sensor, is_anom, n_breaches, int(len(future)),
+                lead_min, round(lower, 4), round(upper, 4),
+                round(float(future["yhat"].iloc[-1]), 4))
+
+    # ─── оценка качества ─────────────────────────────────────────
     def evaluate(self, real_lookback_min=None) -> dict:
         with self._lock:
-            frames = self._pull_frames(real_lookback_min)
+            records = loki_client.fetch_events(
+                config.SENSOR_SERVICE, config.SENSOR_EVENT, real_lookback_min)
+            long_df = features.records_to_long(records)
+            frames = features.machine_frames(long_df)
             windows = self._scenario_windows(real_lookback_min)
 
             tol = pd.Timedelta(minutes=config.EVAL_TOLERANCE_MIN)
@@ -181,10 +391,11 @@ class Pipeline:
             lead_times = []
             untrained = []
 
-            for mid, (_mt, wide) in frames.items():
-                det = self.detectors.get(mid)
+            for (mid, pcode), (mtype, wide) in frames.items():
+                key = _det_key(mtype, pcode) if pcode else None
+                det = self.detectors.get(key) if key else None
                 if det is None or not det.fitted:
-                    untrained.append(mid)
+                    untrained.append(f"{mid}({mtype}/{pcode})")
                     continue
                 scored = det.score(wide)
                 if scored is None:
@@ -208,7 +419,6 @@ class Pipeline:
                         fp += 1
                     elif (not pred) and labeled:
                         fn_points += 1
-                    # lead time: первое обнаружение внутри окна
                     if pred:
                         for i, (w0, w1) in enumerate(mwins):
                             if (w0 - tol) <= ts <= (w1 + tol) and first_det_in_win[i] is None:
@@ -217,7 +427,6 @@ class Pipeline:
                 for i, (w0, w1) in enumerate(mwins):
                     if first_det_in_win[i] is not None:
                         detected_windows += 1
-                        # упреждение: от первого детекта до конца окна (≈ alarm/scrap)
                         lead = (w1 - first_det_in_win[i]).total_seconds() / 60.0
                         if lead > 0:
                             lead_times.append(lead)
@@ -231,7 +440,7 @@ class Pipeline:
 
             result = {
                 "version": self.active_version,
-                "untrained_machines": untrained,
+                "untrained": untrained,
                 "labeled_windows": total_windows,
                 "detected_windows": detected_windows,
                 "window_recall": _round(window_recall),
@@ -248,10 +457,6 @@ class Pipeline:
             return result
 
     def _scenario_windows(self, real_lookback_min=None) -> dict[str, list]:
-        """{machine_id: [(start_dt, end_dt), ...]} из scenario_event-логов.
-
-        start → событие 'start'; end → 'auto_completed'/'stopped' того же
-        scenario_id (если конца нет — берём максимум времени окна)."""
         recs = loki_client.fetch_events(
             config.SCENARIO_SERVICE, config.SCENARIO_EVENT, real_lookback_min)
         starts: dict[str, tuple[str, pd.Timestamp]] = {}
@@ -279,16 +484,14 @@ class Pipeline:
             windows.setdefault(mid, []).append((t0, t1))
         return windows
 
-    # ─── управление версиями весов ───────────────────────────
+    # ─── управление версиями ─────────────────────────────────────
     def activate_version(self, version: str) -> dict:
-        """Загрузить сохранённую версию весов в память и сделать активной."""
         with self._lock:
             detectors = model_store.load_version(version)
             model_store.set_active(version)
             self.detectors = detectors
             self.active_version = version
-            return {"active_version": version,
-                    "machines": sorted(self.detectors)}
+            return {"active_version": version, "keys": sorted(self.detectors)}
 
     def list_models(self) -> dict:
         return {"active": model_store.get_active(),
@@ -298,30 +501,52 @@ class Pipeline:
         with self._lock:
             ok = model_store.delete_version(version)
             if self.active_version == version:
-                # активная удалена — память чистим, новую активную не выбираем
                 self.detectors = {}
                 self.active_version = None
             return {"deleted": ok, "version": version,
                     "active_version": self.active_version}
 
+    def delete_all_versions(self) -> dict:
+        with self._lock:
+            n = model_store.delete_all_versions()
+            self.detectors = {}
+            self.active_version = None
+            self._last_seen.clear()
+            return {"deleted_versions": n, "active_version": None}
+
     def reset_results(self) -> dict:
-        """Чистит результаты в БД и счётчик прогонов. Веса на диске НЕ трогает."""
         with self._lock:
             store.truncate_all()
             self.run_count = 0
             self.last_summary = None
+            self._last_seen.clear()   # иначе после очистки БД дедуп пропустит перескоринг
+            self._persist_count.clear()
             return {"reset": True, "models_kept": True,
                     "active_version": self.active_version}
 
     def status(self) -> dict:
         return {
             "active_version": self.active_version,
-            "trained_machines": sorted(self.detectors.keys()),
+            "trained_keys": sorted(self.detectors.keys()),
             "detectors": [d.meta() for d in self.detectors.values()],
             "run_count": self.run_count,
             "last_summary": self.last_summary,
             "prophet_available": forecaster.available(),
+            "scoring_lookback_min": config.SCORING_LOOKBACK_MIN,
+            "train_points_required": config.TRAIN_POINTS,
         }
+
+    @staticmethod
+    def _window_bounds(frames):
+        lo = hi = None
+        for (_mid, _pcode), (_mt, wide) in frames.items():
+            if wide.empty:
+                continue
+            f, t = wide.index.min(), wide.index.max()
+            lo = f if lo is None or f < lo else lo
+            hi = t if hi is None or t > hi else hi
+        to_dt = lambda x: x.to_pydatetime() if x is not None else None
+        return to_dt(lo), to_dt(hi)
 
 
 def _round(x, n=4):
