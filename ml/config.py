@@ -25,7 +25,7 @@ LOKI_TIMEOUT_SEC = _f("ML_LOKI_TIMEOUT_SEC", "30")
 LOKI_MAX_QUERY_DAYS = _i("ML_LOKI_MAX_QUERY_DAYS", "29")
 # Обучение: запрашиваем последние TRAIN_FETCH_LIMIT строк (direction=backward,
 # без временного окна — работает при любой скорости симулятора).
-TRAIN_FETCH_LIMIT = _i("ML_TRAIN_FETCH_LIMIT", "90000")
+TRAIN_FETCH_LIMIT = _i("ML_TRAIN_FETCH_LIMIT", "150000")
 
 # Метки потоков (см. promtail-config.yaml: relabel → service_name, labels → event/level).
 SENSOR_SERVICE = "equipment"
@@ -43,6 +43,12 @@ ALARM_EVENT = "alarm"
 # сохраняет → z_дрейф = Δ/σ₁₅ как был, ловится. ECOD/IForest калиброваны на 15с-
 # разбросе, на минутных средних почти молчат — ок, они вспомогательные (по ИЛИ).
 RESAMPLE_RULE = os.environ.get("ML_RESAMPLE", "1min")
+# Интервал эмиссии сенсоров симулятором (с). Нужен, чтобы пересчитать сырую σ
+# (15с, на ней учится детектор) в σ ресемплированного ряда (RESAMPLE_RULE) для
+# норма-полосы Prophet: Prophet прогнозирует именно ресемплированный ряд, и шум
+# в нём тише в √n раз (n = бин/интервал независимых показаний). См.
+# detectors.MachineDetector.train_std_resampled.
+SENSOR_INTERVAL_SEC = _f("ML_SENSOR_INTERVAL_SEC", "15")
 MIN_TRAIN_POINTS = _i("ML_MIN_TRAIN_POINTS", "30")       # алгоритмический минимум внутри fit
 TRAIN_POINTS = _i("ML_TRAIN_POINTS", "1000")             # нужно на комбинацию (machine_type, product_code)
 

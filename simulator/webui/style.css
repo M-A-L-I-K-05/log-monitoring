@@ -26,6 +26,10 @@ header h1 { margin: 0 0 0.25rem 0; font-size: 1.4rem; }
     padding: 0.15rem 0.6rem; border-radius: 4px; font-size: 0.85rem;
     font-weight: bold;
 }
+.running-badge.is-running { background: #28a745; }
+.running-badge.is-paused  { background: #e0a800; color: #1a1a1a; }
+.running-badge.is-stopped { background: #6c757d; }
+/* совместимость со старыми классами */
 .running-badge.is-on { background: #28a745; }
 .running-badge.is-off { background: #6c757d; }
 
@@ -43,8 +47,19 @@ header h1 { margin: 0 0 0.25rem 0; font-size: 1.4rem; }
 .btn-green { background: #28a745; }
 .btn-blue { background: #007bff; }
 .btn-red { background: #dc3545; }
+.btn-yellow { background: #e0a800; color: #1a1a1a; }
 .btn-speed { background: #444; }
+.btn-advance { background: #3a3a55; font-size: 0.78rem; padding: 0.3rem 0.55rem; }
 .btn-gray  { background: #555; }
+.pause-toggle { font-size: 0.8rem; color: #ccc; font-weight: normal; cursor: pointer; }
+.pause-toggle input { margin-right: 0.35rem; cursor: pointer; vertical-align: middle; }
+.help-q {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 1.05rem; height: 1.05rem; border-radius: 50%;
+    background: #555; color: #fff; font-size: 0.72rem; font-weight: bold;
+    cursor: help; vertical-align: middle;
+}
+.help-q:hover { background: #17a2b8; }
 .btn:disabled { opacity: 0.5; cursor: default; }
 .btn:hover { opacity: 0.85; }
 

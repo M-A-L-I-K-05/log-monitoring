@@ -167,8 +167,10 @@ function render(data) {
     $("virtual-time").textContent = data.virtual_time.replace("T", " ").slice(0, 19);
     $("speed-badge").textContent = "×" + data.speed;
     const rb = $("running-badge");
-    rb.textContent = data.running ? "running" : "paused";
-    rb.className = "running-badge " + (data.running ? "is-on" : "is-off");
+    // status: running | paused | stopped (приходит с бэка); fallback на running-флаг.
+    const st = data.status || (data.running ? "running" : "paused");
+    rb.textContent = st;
+    rb.className = "running-badge is-" + st;
 
     const c = data.counters;
     $("counters").textContent =
@@ -479,6 +481,7 @@ function openScenarioModal(machine) {
         sel.appendChild(opt);
     }
     $("modal-msg").textContent = "";
+    $("modal-pause-on-start").checked = false;
     updateScenarioModeHint();
     $("scenario-modal").classList.remove("hidden");
 }
@@ -491,13 +494,14 @@ async function submitScenario() {
     const machine_id = $("modal-machine-id").dataset.machineId;
     const scenario_type = $("modal-scenario-type").value;
     const severity = $("modal-severity").value;
+    const pause_on_start = $("modal-pause-on-start").checked;
     const msg = $("modal-msg");
     msg.textContent = "...";
     try {
         const r = await fetch("/scenarios/start", {
             method: "POST",
             headers: {"Content-Type": "application/json"},
-            body: JSON.stringify({machine_id, scenario_type, severity}),
+            body: JSON.stringify({machine_id, scenario_type, severity, pause_on_start}),
         });
         const data = await r.json();
         if (!r.ok) {
@@ -517,8 +521,33 @@ async function submitScenario() {
 
 // ─── controls ───────────────────────────────────────────────
 $("btn-start").onclick = () => postCmd("/start");
+$("btn-pause").onclick = () => postCmd("/pause");
 $("btn-stop").onclick = () => postCmd("/stop");
 $("btn-restart").onclick = () => postCmd("/restart");
+
+// Перемотка вперёд (+N мин). Запрос блокирующий (сервер прокручивает все логи),
+// поэтому на время запроса гасим кнопки перемотки.
+document.querySelectorAll(".btn-advance").forEach(btn => {
+    btn.onclick = async () => {
+        const adv = document.querySelectorAll(".btn-advance");
+        adv.forEach(b => b.disabled = true);
+        const orig = btn.textContent;
+        btn.textContent = "…";
+        try {
+            await fetch("/advance", {
+                method: "POST",
+                headers: {"Content-Type": "application/json"},
+                body: JSON.stringify({minutes: parseInt(btn.dataset.advance)}),
+            });
+            await fetchStatus();
+        } catch (e) {
+            console.error("advance failed", e);
+        } finally {
+            btn.textContent = orig;
+            adv.forEach(b => b.disabled = false);
+        }
+    };
+});
 $("btn-sync-fleet").onclick = async () => {
     const btn = $("btn-sync-fleet");
     const orig = btn.textContent;

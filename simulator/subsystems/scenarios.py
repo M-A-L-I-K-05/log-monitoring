@@ -64,8 +64,38 @@ class ScenariosController:
         for sid in finished:
             self._cleanup_scenario(sid, now)
 
+        self._check_pause_on_start()
+
         if self._auto_enabled:
             self._maybe_auto_start(now)
+
+    # ─── Авто-пауза при старте сценария ──────────────────────
+    def _check_pause_on_start(self) -> None:
+        """Если у активного сценария взведён pause_on_start — ставим симулятор
+        на паузу в момент, когда деформация реально начинается.
+
+        Печь: деформация включается phase-lock'ом только в trigger_phase
+        (carburizing/quenching), поэтому ждём, пока загрузка войдёт в эту фазу.
+        Остальные станки: деформация идёт, как только станок в running.
+        """
+        for meta in self.active.values():
+            if not meta.get("pause_on_start") or meta.get("_pause_done"):
+                continue
+            if meta.get("status") != "active":
+                continue
+            mid = meta.get("machine_id")
+            machine = self.state.machines.get(mid)
+            trigger = meta.get("trigger_phase")
+            if trigger:
+                load = self.state.furnace_loads.get(mid)
+                deforming = load is not None and load.phase == trigger
+            else:
+                deforming = machine is not None and machine.state == "running"
+            if deforming:
+                self.state.pause()
+                meta["_pause_done"] = True
+                logger.info("auto-paused simulator on scenario %s start (%s on %s)",
+                            meta.get("id"), meta.get("scenario_type"), mid)
 
     # ─── Авто-режим ──────────────────────────────────────────
     def _maybe_auto_start(self, now: datetime) -> None:
@@ -146,7 +176,8 @@ class ScenariosController:
     # ─── публичный API: старт ────────────────────────────────
     def start_scenario(self, machine_id: str, scenario_type: str,
                        severity: str = config.DEFAULT_SEVERITY,
-                       parts_limit: int = 30) -> str:
+                       parts_limit: int = 30,
+                       pause_on_start: bool = False) -> str:
         machine = self.state.machines.get(machine_id)
         if machine is None:
             raise ValueError(f"machine {machine_id} not found")
@@ -236,6 +267,10 @@ class ScenariosController:
             "parts_limit_effective": parts_limit_effective,
             "started_at": self.state.virtual_time,
             "status": "active",
+            # Авто-пауза: когда деформация реально начнётся (для печи — вход в
+            # trigger-фазу, для остальных — станок в running), цикл встаёт на паузу.
+            "pause_on_start": bool(pause_on_start),
+            "_pause_done": False,
         }
         self.active[sid] = meta
         self.state.scenarios_registry[sid] = meta

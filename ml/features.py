@@ -121,14 +121,23 @@ def machine_frames(long_df: pd.DataFrame,
 
 
 def type_product_frames(long_df: pd.DataFrame,
-                        resample: str = None,
                         max_points: int = None) -> dict[tuple, tuple]:
     """{(machine_type, context): (n_points, wide_df)} — для обучения.
 
     Для обычных станков context = product_code.
     Для печи context = фаза (carburizing / quenching), определяется из сенсоров.
+
+    ВАЖНО: обучение идёт на СЫРЫХ последних max_points показаниях — БЕЗ resample и
+    БЕЗ ffill (в отличие от скоринга в machine_frames). Это намеренно:
+      • resample/ffill при обучении заполнял бы дыры простоя станка (он шлёт данные
+        только в фазе running) плоскими повторами → дисперсия схлопывалась, σ нормы
+        занижалась вдвое и больше → на скоринге z раздувался → потоп ложных аномалий.
+      • Сырая σ — 15-секундная («громкая»). Скоринг же усредняет 4 показания в минуту
+        («тихая» σ/2), поэтому шум на скоринге даёт z ≈ вдвое меньше и не доходит до
+        ANOMALY_Z, а реальный дрейф (сдвиг среднего) усреднение сохраняет → ловится.
+    «Последние max_points» = последние реальные показания по времени, а не минуты:
+    станок их отдаёт примерно за max_points·SENSOR_INTERVAL непрерывной работы.
     """
-    resample = resample or config.RESAMPLE_RULE
     max_points = max_points or config.TRAIN_POINTS
     frames: dict[tuple, tuple] = {}
     if long_df.empty:
@@ -154,8 +163,9 @@ def type_product_frames(long_df: pd.DataFrame,
                     pw = filter_furnace_phase(raw, phase)
                     if pw.empty:
                         continue
-                    pw = pw.resample(resample).mean().dropna(axis=1, how="all")
-                    pw = pw.ffill().dropna(how="all")
+                    # БЕЗ resample/ffill: только убираем мёртвые сенсоры чужой фазы
+                    # и пустые строки. Остаётся сырой ряд показаний этой фазы.
+                    pw = pw.dropna(axis=1, how="all").dropna(how="all")
                     if not pw.empty:
                         parts[phase].append(pw)
             for phase, plist in parts.items():
@@ -171,9 +181,22 @@ def type_product_frames(long_df: pd.DataFrame,
             for pcode, pg in mg.groupby("product_code", dropna=True):
                 if pd.isna(pcode) or pcode is None:
                     continue
-                wide = pg.pivot_table(index="event_time", columns="sensor",
-                                      values="value", aggfunc="mean").sort_index()
-                wide = wide.resample(resample).mean().ffill().dropna(how="all")
+                # Пивотим ПОМАШИННО и конкатим строками, чтобы не усреднять разные
+                # станки одного типа, попавшие на один event_time (общий pivot с
+                # aggfunc=mean занижал бы дисперсию). Внутри станка event_time
+                # уникален → показания остаются сырыми, без усреднения.
+                parts_list = []
+                for _mid, mmg in pg.groupby("machine_id"):
+                    w = mmg.pivot_table(index="event_time", columns="sensor",
+                                        values="value", aggfunc="mean").sort_index()
+                    if not w.empty:
+                        parts_list.append(w)
+                if not parts_list:
+                    continue
+                common = [c for c in parts_list[0].columns
+                          if all(c in p.columns for p in parts_list)]
+                wide = pd.concat([p[common] for p in parts_list]).sort_index()
+                wide = wide.dropna(how="all")
                 if wide.empty:
                     continue
                 if len(wide) > max_points:

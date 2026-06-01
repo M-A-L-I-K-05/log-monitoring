@@ -24,6 +24,11 @@ class SimulationState:
         # ─── Lock на всё состояние ──
         self._lock = threading.RLock()
 
+        # ─── Перемотка вперёд (накопленные виртуальные секунды) ──
+        # Кнопки +N мин добавляют сюда; главный цикл вычитывает чанками
+        # (take_ff_chunk), продвигая virtual_time и тикая подсистемы без sleep.
+        self._ff_remaining_sec: float = 0.0
+
         # ─── Парк станков ──
         self.machines: dict[str, Machine] = {}
         for mid, mtype, wc, _model in config.MACHINES:
@@ -113,12 +118,41 @@ class SimulationState:
         with self._lock:
             self.speed = speed
 
+    # ─── Перемотка вперёд ─────────────────────────────────────
+    def request_fast_forward(self, minutes: float) -> None:
+        """Поставить в очередь перемотку на `minutes` виртуальных минут."""
+        with self._lock:
+            self._ff_remaining_sec += max(0.0, minutes) * 60.0
+
+    def ff_pending(self) -> float:
+        with self._lock:
+            return self._ff_remaining_sec
+
+    def clear_ff(self) -> None:
+        with self._lock:
+            self._ff_remaining_sec = 0.0
+
+    def take_ff_chunk(self, step_sec: float) -> float:
+        """Откусить чанк перемотки: продвинуть virtual_time, вернуть dt (сек).
+
+        Продвигает время БЕЗУСЛОВНО (главный цикл сам гарантирует running на
+        время перемотки). 0 → очередь пуста.
+        """
+        with self._lock:
+            if self._ff_remaining_sec <= 0:
+                return 0.0
+            dt = min(step_sec, self._ff_remaining_sec)
+            self._ff_remaining_sec -= dt
+            self.virtual_time += timedelta(seconds=dt)
+            return dt
+
     # ─── Сброс к исходному состоянию ──────────────────────────
     def reset(self) -> None:
         """Привести все данные к начальному состоянию (как после __init__)."""
         with self._lock:
             self.virtual_time = config.SIM_START_TIME
             self.speed = config.DEFAULT_SPEED
+            self._ff_remaining_sec = 0.0
 
             # пересоздаём станки
             self.machines.clear()

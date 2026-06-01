@@ -65,11 +65,16 @@ class SpeedRequest(BaseModel):
     multiplier: float
 
 
+class AdvanceRequest(BaseModel):
+    minutes: float
+
+
 class StartScenarioRequest(BaseModel):
     machine_id: str
     scenario_type: str
     severity: str = config.DEFAULT_SEVERITY
     parts_limit: int = 30
+    pause_on_start: bool = False
 
 
 class StopScenarioRequest(BaseModel):
@@ -91,14 +96,24 @@ class AutoOrdersRequest(BaseModel):
 
 
 # ─── endpoints ───────────────────────────────────────────────
+def _status_str() -> str:
+    """running — поток жив и идёт; paused — поток жив, но state на паузе;
+    stopped — поток цикла не запущен."""
+    if not loop.is_alive():
+        return "stopped"
+    return "running" if state.running else "paused"
+
+
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "simulator", "alive": loop.is_alive()}
+    return {"status": "ok", "service": "simulator", "alive": loop.is_alive(),
+            "sim_status": _status_str()}
 
 
 @app.get("/status")
 def get_status():
     snap = state.snapshot()
+    snap["status"] = _status_str()
     snap["active_scenarios"] = scenarios.list_active()
     snap["auto_orders"] = orders_sub.get_auto_status()
     return snap
@@ -107,24 +122,71 @@ def get_status():
 @app.post("/start")
 def start():
     loop.start()
-    return {"ok": True, "running": state.running}
+    return {"ok": True, "status": _status_str()}
+
+
+@app.post("/pause")
+def pause():
+    loop.pause()
+    return {"ok": True, "status": _status_str()}
 
 
 @app.post("/stop")
 def stop():
     loop.stop()
-    return {"ok": True, "running": state.running}
+    return {"ok": True, "status": _status_str()}
+
+
+@app.post("/advance")
+def advance(req: AdvanceRequest):
+    """Перемотка виртуального времени вперёд на N минут с генерацией логов."""
+    if req.minutes not in config.ADVANCE_ALLOWED_MIN:
+        raise HTTPException(
+            status_code=400,
+            detail=f"minutes must be one of {config.ADVANCE_ALLOWED_MIN}")
+    loop.fast_forward(req.minutes)
+    return {"ok": True, "status": _status_str(),
+            "virtual_time": state.virtual_time.isoformat()}
+
+
+_LOKI_DATA_DIRS = ("/loki/chunks /loki/wal /loki/tsdb-shipper-active "
+                   "/loki/tsdb-shipper-cache /loki/compactor")
 
 
 def _clear_loki_async() -> None:
-    """Удаляет все данные Loki и перезапускает контейнер (в фоне)."""
+    """Полная чистая очистка хранилища Loki БЕЗ гонки (в фоне).
+
+    Раньше rm шёл «на ходу» при работающем Loki, после чего контейнер
+    рестартился — Loki успевал сбросить in-memory чанки/индекс между rm и
+    рестартом, и индекс начинал ссылаться на уже удалённые чанки
+    (`500 failed to load chunk ... no such file`), из-за чего падали любые
+    широкие запросы (в т.ч. обучение). Теперь: СТОП Loki → стираем данные
+    временным контейнером (volumes_from, та же /loki) → СТАРТ Loki. Пока Loki
+    остановлен, никаких записей в его хранилище нет, поэтому осиротевших чанков
+    не остаётся; индекс пересобирается с нуля.
+    """
+    log = logging.getLogger("simulator.restart")
+    dc = None
     try:
         dc = docker_sdk.from_env()
         loki = dc.containers.get("loki")
-        loki.exec_run("sh -c 'rm -rf /loki/chunks /loki/wal /loki/tsdb-shipper-active /loki/tsdb-shipper-cache /loki/compactor'")
-        loki.restart(timeout=10)
+        image = loki.image.tags[0] if loki.image.tags else "grafana/loki:3.0.0"
+        loki.stop(timeout=15)
+        # Стираем данные, пока Loki остановлен — через одноразовый контейнер,
+        # которому отдаём те же тома (volumes_from), чтобы /loki был доступен.
+        dc.containers.run(
+            image, entrypoint="sh", command=["-c", f"rm -rf {_LOKI_DATA_DIRS}"],
+            volumes_from=[loki.id], remove=True)
+        loki.start()
+        log.info("loki_cleaned")
     except Exception as exc:
-        logging.getLogger("simulator.restart").warning("Loki cleanup failed: %s", exc)
+        log.warning("Loki cleanup failed: %s", exc)
+        # Если что-то пошло не так после stop — пытаемся вернуть Loki в строй.
+        try:
+            if dc is not None:
+                dc.containers.get("loki").start()
+        except Exception:
+            pass
 
 
 @app.post("/restart")
@@ -181,6 +243,7 @@ def start_scenario(req: StartScenarioRequest):
             scenario_type=req.scenario_type,
             severity=req.severity,
             parts_limit=req.parts_limit,
+            pause_on_start=req.pause_on_start,
         )
         return {"ok": True, "scenario_id": sid}
     except ValueError as exc:

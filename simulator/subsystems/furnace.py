@@ -494,7 +494,7 @@ class FurnaceSubsystem:
             apply_modifier = (trigger is not None and phase == trigger)
         result = {}
         for name, (mean, std, _unit) in profile.items():
-            value = random.gauss(mean, std)
+            value = config.bounded_gauss(mean, std)
             if apply_modifier:
                 modifier = machine.anomaly_modifier.get(name)
                 if modifier is not None:

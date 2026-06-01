@@ -35,6 +35,10 @@ class MachineDetector:
         self.iforest: IForest | None = None
         self.train_mean: pd.Series | None = None
         self.train_std: pd.Series | None = None
+        # σ ресемплированного (минутного) ряда — норма-полоса для Prophet (он
+        # прогнозирует ресемплированный ряд, а не сырые 15с). Детекция её НЕ
+        # использует, ей нужна сырая train_std.
+        self.train_std_resampled: pd.Series | None = None
         self.n_train = 0
         self.trained_at: str | None = None      # реальное время обучения (ISO)
         self.train_window: list | None = None   # [from, to] виртуального окна
@@ -64,6 +68,12 @@ class MachineDetector:
         # сохраняем mean/std обучающего окна для объяснимости (z-вклад сенсора)
         self.train_mean = X.mean()
         self.train_std = X.std(ddof=0).replace(0, np.nan)
+        # Минутная σ для Prophet: при усреднении n = бин/интервал независимых
+        # показаний (шум симулятора i.i.d.) σ падает в √n раз. Так норма-полоса
+        # Prophet меряется в той же шкале, что и ряд, который он прогнозирует.
+        _bin = pd.Timedelta(config.RESAMPLE_RULE).total_seconds()
+        _n = max(1.0, _bin / config.SENSOR_INTERVAL_SEC)
+        self.train_std_resampled = self.train_std / np.sqrt(_n)
         self.n_train = len(X)
         self.trained_at = datetime.now(timezone.utc).isoformat()
         if not X.empty:

@@ -512,7 +512,7 @@ class EquipmentSubsystem:
         product_mods = config.SENSOR_MODIFIERS_BY_PRODUCT.get(product_code, {}) if product_code else {}
         result = {}
         for name, (mean, std, _unit) in profile.items():
-            value = random.gauss(mean, std)
+            value = config.bounded_gauss(mean, std)
             product_mult = product_mods.get(name)
             if product_mult is not None:
                 value *= product_mult

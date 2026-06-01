@@ -1,5 +1,6 @@
 """Configuration: все константы симулятора в одном месте."""
 import os
+import random
 from datetime import datetime
 
 # ─── Реальное время ────────────────────────────────────────────
@@ -10,6 +11,14 @@ HTTP_TIMEOUT_SEC = 10.0
 SIM_START_TIME = datetime(2026, 1, 1, 8, 0, 0)
 DEFAULT_SPEED = 1.0
 ALLOWED_SPEEDS = [1, 10, 100, 300, 1000]
+
+# ─── Перемотка вперёд (кнопки +N мин) ──────────────────────────
+# «Скачок» виртуального времени с генерацией всех логов: цикл прокручивает
+# подсистемы шагами по FAST_FORWARD_STEP_SEC виртуальных секунд (подсистемы
+# догоняют sensor_readings через свои while-циклы), реальный sleep пропускается.
+# Шаг 60с безопасен: симулятор штатно работает на 1000x (шаг 100с/тик).
+ADVANCE_ALLOWED_MIN = [1, 10, 30]
+FAST_FORWARD_STEP_SEC = 60.0
 
 # ─── Общие тайминги (виртуальные секунды) ──────────────────────
 SETUP_TIME_SEC = 420         # 7 минут наладки (обрабатывающие станки: смена резца/фрезы)
@@ -584,6 +593,31 @@ MACHINES = [
     ("M-GMM-02",   "inspection", "inspection",     "KLINGELNBERG-P26"),
 ]
 INSTALL_DATE = "2024-01-01"
+
+# ─── Генерация сенсорного шума ─────────────────────────────────
+# Усечение гауссова шума по ±SENSOR_NOISE_CLIP_SIGMA·std (truncated normal).
+# Обычный random.gauss даёт ~0.3% выбросов за 3σ на каждый сенсор — на парке
+# из десятков сенсоров это регулярно превышало порог ML (ANOMALY_Z=2.8) и
+# давало ЛОЖНЫЕ аномалии даже в норме. Усечение ниже порога (2.5 < 2.8) →
+# нормальные показания физически не дотягивают до аномалии, а сценарии
+# (anomaly_modifier применяется СНАРУЖИ, после шума) по-прежнему уходят далеко.
+SENSOR_NOISE_CLIP_SIGMA = float(os.environ.get("SIM_NOISE_CLIP_SIGMA", "2.5"))
+
+
+def bounded_gauss(mean: float, std: float, clip_sigma: float = None) -> float:
+    """Гауссов шум, усечённый по ±clip_sigma·std (rejection sampling).
+
+    Убирает редкие выбросы-«скачки» за 3σ. Дрейф/сценарий накладывается
+    отдельно (умножением на anomaly_modifier), усечение его не трогает.
+    """
+    if std <= 0:
+        return mean
+    cs = SENSOR_NOISE_CLIP_SIGMA if clip_sigma is None else clip_sigma
+    while True:
+        z = random.gauss(0.0, 1.0)
+        if -cs <= z <= cs:
+            return mean + z * std
+
 
 # ─── Сенсорные профили (mean, std, unit) ──────────────────────
 # Используются и для нормальной генерации, и для определения структуры данных.

@@ -6,7 +6,7 @@
   "id": null,
   "links": [],
   "liveNow": false,
-  "refresh": "5s",
+  "refresh": "10s",
   "schemaVersion": 39,
   "tags": ["ml", "vkr", "prophet", "forecast"],
   "templating": {
@@ -18,7 +18,7 @@
         "datasource": {"type": "grafana-postgresql-datasource", "uid": "PCC52D03280B7034C"},
         "definition": "SELECT machine_id FROM machines WHERE machine_type <> 'inspection' ORDER BY array_position(ARRAY['turning','hobbing','shaving','furnace','grinding']::text[], machine_type), machine_id",
         "query": "SELECT machine_id FROM machines WHERE machine_type <> 'inspection' ORDER BY array_position(ARRAY['turning','hobbing','shaving','furnace','grinding']::text[], machine_type), machine_id",
-        "refresh": 2,
+        "refresh": 1,
         "sort": 0,
         "includeAll": true,
         "multi": true,

@@ -8,6 +8,7 @@
 """
 import logging
 import threading
+from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
@@ -43,6 +44,11 @@ class Pipeline:
         # горяч. {key: {channel: count}}. Переживает батчи, поэтому серия
         # считается через границы прогонов.
         self._persist_count: dict[tuple, dict[str, int]] = {}
+        # Реальное время конца прошлого успешного фетча скоринга — чтобы окно
+        # «догоняло» пачку логов после перемотки (+N мин) или паузы симулятора,
+        # а не ограничивалось фиксированными ~10с. Дедуп по virtual event_time
+        # ниже всё равно не даст записать одну точку дважды.
+        self._last_fetch_end: datetime | None = None
         self._lock = threading.Lock()
         self._load_active_on_start()
 
@@ -137,7 +143,8 @@ class Pipeline:
                 do_forecast = (self.run_count % config.FORECAST_EVERY_RUNS == 1)
 
             records = loki_client.fetch_events(
-                config.SENSOR_SERVICE, config.SENSOR_EVENT, lookback_min)
+                config.SENSOR_SERVICE, config.SENSOR_EVENT,
+                self._effective_lookback(lookback_min))
             long_df = features.records_to_long(records)
             frames = features.machine_frames(long_df)
 
@@ -201,6 +208,22 @@ class Pipeline:
             self.last_summary = summary
             logger.info("run_done", extra={"details": summary})
             return summary
+
+    def _effective_lookback(self, lookback_min) -> float:
+        """Окно fetch_events с «догоном»: не уже базового, но растягивается назад
+        до прошлого успешного фетча. Так пачка логов после перемотки (+N мин) или
+        после паузы попадёт в окно при любом тайминге тика. Дедуп по virtual
+        event_time не даст записать одну точку дважды. Ограничено пределом длины
+        запроса Loki."""
+        base = lookback_min if lookback_min is not None else config.SCORING_LOOKBACK_MIN
+        now_wall = datetime.now(timezone.utc)
+        eff = base
+        if self._last_fetch_end is not None:
+            gap_min = (now_wall - self._last_fetch_end).total_seconds() / 60.0
+            eff = max(base, gap_min + config.SCORING_MARGIN_SEC / 60.0)
+        eff = min(eff, config.LOKI_MAX_QUERY_DAYS * 24 * 60)
+        self._last_fetch_end = now_wall
+        return eff
 
     def _apply_persistence(self, key: tuple, scored: pd.DataFrame) -> pd.DataFrame:
         """SPC run-rule ПО-КАНАЛЬНО: аномалия, когда ХОТЯ БЫ ОДИН «горячий» канал
@@ -339,6 +362,20 @@ class Pipeline:
         cols = set(det.columns or [])
         return [s for s in wanted if s in cols]
 
+    def _prophet_band_std(self, det, sensor, raw_std):
+        """σ для норма-полосы Prophet в МИНУТНОЙ шкале (как у ряда, что он
+        прогнозирует). Берём сохранённую при обучении train_std_resampled; если
+        её нет (старая модель) — пересчитываем из сырой σ: при усреднении
+        n = бин/интервал независимых показаний σ падает в √n раз."""
+        rs = getattr(det, "train_std_resampled", None)
+        if rs is not None and sensor in rs.index:
+            val = float(rs[sensor])
+            if np.isfinite(val) and val > 0:
+                return val
+        bin_sec = pd.Timedelta(config.RESAMPLE_RULE).total_seconds()
+        n = max(1.0, bin_sec / config.SENSOR_INTERVAL_SEC)
+        return raw_std / np.sqrt(n)
+
     def _prophet_check_sensor(self, mid, mtype, ctx, det, wide, sensor):
         """Прогноз одного сенсора + проверка выхода за норму. Возвращает кортеж
         для store.upsert_prophet_status или None, если прогноз не построить."""
@@ -358,8 +395,17 @@ class Pipeline:
         if not np.isfinite(std) or std <= 0:
             return None
 
-        lower = mean - config.ANOMALY_Z * std
-        upper = mean + config.ANOMALY_Z * std
+        # Полосу меряем МИНУТНОЙ σ: Prophet прогнозирует ресемплированный (минутный)
+        # ряд, а детекторная train_std — сырая 15с (вдвое «громче»). С сырой σ полоса
+        # была бы вдвое шире, и прогноз почти никогда её не пробивал бы. Берём
+        # сохранённую при обучении train_std_resampled; для старых моделей без неё —
+        # пересчитываем из сырой σ по тому же √n.
+        band_std = self._prophet_band_std(det, sensor, std)
+        if band_std is None or not np.isfinite(band_std) or band_std <= 0:
+            return None
+
+        lower = mean - config.ANOMALY_Z * band_std
+        upper = mean + config.ANOMALY_Z * band_std
         future = fc[fc["actual"].isna()]      # только горизонт (без in-sample)
         if future.empty:
             return None
@@ -521,6 +567,7 @@ class Pipeline:
             self.last_summary = None
             self._last_seen.clear()   # иначе после очистки БД дедуп пропустит перескоринг
             self._persist_count.clear()
+            self._last_fetch_end = None
             return {"reset": True, "models_kept": True,
                     "active_version": self.active_version}
 

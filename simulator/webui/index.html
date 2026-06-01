@@ -17,8 +17,13 @@
         </div>
         <div class="controls">
             <button id="btn-start" class="btn btn-green">Start</button>
+            <button id="btn-pause" class="btn btn-yellow">Pause</button>
             <button id="btn-stop" class="btn btn-red">Stop</button>
             <button id="btn-restart" class="btn btn-blue">Restart</button>
+            <span class="separator">|</span>
+            <button class="btn btn-advance" data-advance="1" title="Перемотать вперёд на 1 мин (с логами)">+1 мин</button>
+            <button class="btn btn-advance" data-advance="10" title="Перемотать вперёд на 10 мин (с логами)">+10 мин</button>
+            <button class="btn btn-advance" data-advance="30" title="Перемотать вперёд на 30 мин (с логами)">+30 мин</button>
             <span class="separator">|</span>
             <button class="btn btn-speed" data-speed="1">×1</button>
             <button class="btn btn-speed" data-speed="10">×10</button>
@@ -175,6 +180,13 @@
                         <option value="clear" selected>clear</option>
                         <option value="gross">gross</option>
                     </select>
+                </div>
+                <div class="form-row">
+                    <label for="modal-pause-on-start">Пауза при старте</label>
+                    <label class="pause-toggle">
+                        <input type="checkbox" id="modal-pause-on-start">
+                        <span class="help-q" title="Поставить симулятор на паузу, как только начнётся деформация. Для печи — в момент входа загрузки в trigger-фазу (carburizing / quenching); для остальных станков — как только станок в running.">?</span>
+                    </label>
                 </div>
                 <div class="form-row form-actions">
                     <button id="modal-submit" class="btn btn-green">Старт</button>
