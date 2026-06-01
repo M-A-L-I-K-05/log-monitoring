@@ -113,6 +113,24 @@ def fetch_for_machine(machine_id: str, product_code: str,
     return filtered
 
 
+def fetch_recent(max_lines: int = None) -> list[dict]:
+    """Последние max_lines sensor_reading по ВСЕМ станкам одним лёгким запросом.
+
+    Селектор только по меткам ({service,event}, без `| json`) — Loki быстро отдаёт
+    сырые строки, JSON парсим в Python (records_to_long). Для Prophet: один bulk
+    вместо тяжёлых per-station `| json | entity_id=` (entity_id не индексируется как
+    метка). Разрез по (станок, контекст) — на стороне клиента (features.prophet_frames).
+    """
+    max_lines = max_lines or config.TRAIN_FETCH_LIMIT
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(days=config.LOKI_MAX_QUERY_DAYS)
+    logql = '{service_name="%s", event="%s"}' % (config.SENSOR_SERVICE, config.SENSOR_EVENT)
+    records = query_range(logql, start, end, max_lines=max_lines)
+    logger.info("loki_fetch_recent", extra={"details": {
+        "records": len(records), "max_lines": max_lines}})
+    return records
+
+
 def fetch_for_training() -> list[dict]:
     """Последние TRAIN_FETCH_LIMIT sensor_reading для обучения.
 

@@ -63,6 +63,67 @@ def filter_furnace_phase(wide: pd.DataFrame, phase: str) -> pd.DataFrame:
     return wide.iloc[0:0]
 
 
+def to_continuous_minutes(wide: pd.DataFrame, max_points: int = None) -> pd.DataFrame:
+    """Ряд для Prophet: минутный ресемпл → выброс реальных дыр → перенос на
+    НЕПРЕРЫВНУЮ синтетическую ось минут.
+
+    Зачем: показания одного контекста (фаза печи / шестерня) накапливаются за много
+    циклов с реальными простоями между ними (часы — печь не в этой фазе, станок встал
+    или гнал другую партию). Prophet прогнозирует «следующие N минут РАБОТЫ в этом
+    режиме», календарное время простоев не нужно — кладём минуты подряд (0,1,2,…).
+    БЕЗ ffill: дыры нельзя заполнять плоскими повторами, иначе занижается дисперсия
+    (та же ловушка, что в обучении детектора). max_points — окно памяти: оставить
+    только последние N минут контекста, чтобы старые нормальные циклы не размывали
+    текущий дрейф.
+    """
+    if wide.empty:
+        return wide
+    w = wide.resample(config.RESAMPLE_RULE).mean().dropna(how="all")
+    if w.empty:
+        return w
+    if max_points and len(w) > max_points:
+        w = w.iloc[-max_points:]
+    # переносим значения (в исходном хронологическом порядке) на непрерывную ось минут
+    w = w.copy()
+    w.index = pd.date_range(end=w.index.max().floor("min"),
+                            periods=len(w), freq=config.RESAMPLE_RULE)
+    return w
+
+
+def prophet_frames(long_df: pd.DataFrame, max_points: int = None) -> dict[tuple, tuple]:
+    """{(machine_id, context): (machine_type, wide)} для Prophet из ОДНОГО bulk-fetch.
+
+    context = product_code (станок) / фаза (печь). Ряд каждого контекста переносится на
+    непрерывную ось (to_continuous_minutes) и обрезается до последних max_points минут.
+    Отличие от machine_frames (скоринг, малое окно, resample+ffill) — здесь длинная
+    история контекста на непрерывной оси под прогноз.
+    """
+    frames: dict[tuple, tuple] = {}
+    if long_df.empty:
+        return frames
+    for mid, g in long_df.groupby("machine_id"):
+        mtype = g["machine_type"].iloc[0]
+        if mtype in config.SKIP_MACHINE_TYPES:
+            continue
+        if mtype == "furnace":
+            raw = g.pivot_table(index="event_time", columns="sensor",
+                                values="value", aggfunc="mean").sort_index()
+            for phase in config.FURNACE_ML_PHASES:
+                pw = to_continuous_minutes(filter_furnace_phase(raw, phase), max_points)
+                if not pw.empty:
+                    frames[(mid, phase)] = (mtype, pw)
+        else:
+            for pcode, pg in g.groupby("product_code", dropna=True):
+                if pd.isna(pcode) or pcode is None:
+                    continue
+                w = pg.pivot_table(index="event_time", columns="sensor",
+                                   values="value", aggfunc="mean").sort_index()
+                w = to_continuous_minutes(w, max_points)
+                if not w.empty:
+                    frames[(mid, pcode)] = (mtype, w)
+    return frames
+
+
 def _keep_context(mtype: str, pcode) -> bool:
     """Проверяет, нужно ли обрабатывать комбинацию (machine_type, product_code/phase).
 

@@ -647,6 +647,16 @@ $("order-modal").addEventListener("click", (e) => {
     if (e.target === $("order-modal")) closeOrderModal();
 });
 
+// ─── Инструкция ───────────────────────────────────────────────
+$("btn-help").onclick = () => $("help-modal").classList.remove("hidden");
+$("help-modal-close").onclick = () => $("help-modal").classList.add("hidden");
+$("help-modal").addEventListener("click", (e) => {
+    if (e.target === $("help-modal")) $("help-modal").classList.add("hidden");
+});
+document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") $("help-modal").classList.add("hidden");
+});
+
 // Галочка авто-заказов
 document.addEventListener("DOMContentLoaded", () => {
     const chk = $("chk-auto-orders");

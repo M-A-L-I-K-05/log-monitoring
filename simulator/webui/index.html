@@ -8,7 +8,10 @@
 <body>
     <header>
         <div class="header-left">
-            <h1>Factory Simulator</h1>
+            <div class="title-row">
+                <h1>Factory Simulator</h1>
+                <button id="btn-help" class="btn btn-gray btn-tiny" type="button">? Инструкция</button>
+            </div>
             <div class="status-line">
                 <span class="virtual-time" id="virtual-time">—</span>
                 <span class="speed-badge" id="speed-badge">×1</span>
@@ -231,6 +234,45 @@
                     <button id="order-modal-cancel" class="btn btn-gray">Отмена</button>
                 </div>
                 <div class="modal-msg" id="order-modal-msg"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Модалка: инструкция -->
+    <div id="help-modal" class="modal hidden">
+        <div class="modal-card modal-card-wide">
+            <div class="modal-header">
+                <h3>Инструкция</h3>
+                <button class="modal-close" id="help-modal-close" type="button">✕</button>
+            </div>
+            <div class="modal-body help-body">
+                <h4>Что это</h4>
+                <p>Симулятор зуборезного завода: гонит партии по маршруту
+                   (токарная → зуборезная → шевингование → цементация в печи →
+                   шлифовка → измерение) и пишет сенсорные логи в Loki, по которым
+                   работает ML-сервис.</p>
+
+                <h4>Управление прогоном</h4>
+                <p><b>Start / Pause / Stop / Restart</b> — запуск, пауза, остановка
+                   и перезапуск с нуля. <b>+1 / +10 / +30 мин</b> — перемотка вперёд
+                   с генерацией логов. <b>×1 … ×1000</b> — скорость виртуального
+                   времени (для обучения ML удобно ×1000).</p>
+
+                <h4>Заказы и партии</h4>
+                <p><b>+ Order</b> — создать заказ (продукт, приоритет, количество);
+                   он разбивается на партии и идёт по маршруту. <b>Auto Orders</b> —
+                   автоматически подкидывать новые заказы.</p>
+
+                <h4>Сценарии аномалий</h4>
+                <p>Клик по карточке станка открывает запуск сценария: тип, тяжесть
+                   (light / clear / gross) и «пауза при старте». <b>Gradual</b> —
+                   постепенный дрейф параметра, <b>Step</b> — резкий скачок.
+                   <b>Auto Scenarios</b> — случайные сценарии сами по себе,
+                   <b>Stop All</b> — снять все активные.</p>
+
+                <h4>Sync Fleet</h4>
+                <p>Пересобрать парк станков из конфигурации (после изменения состава
+                   оборудования).</p>
             </div>
         </div>
     </div>

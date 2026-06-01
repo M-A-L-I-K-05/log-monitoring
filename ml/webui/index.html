@@ -9,7 +9,10 @@
 <body>
 <header>
     <div>
-        <h1>ML-сервис</h1>
+        <div class="title-row">
+            <h1>ML-сервис</h1>
+            <button id="btn-help" class="btn btn-tiny btn-gray" type="button">? Инструкция</button>
+        </div>
         <div class="sub">детекция аномалий (ECOD + IsolationForest) и прогноз (Prophet)</div>
     </div>
     <div class="status-line">
@@ -24,19 +27,6 @@
     <!-- ── Обучение ─────────────────────────────────────── -->
     <section>
         <h2>Обучение модели <span class="counters">фит на чистом baseline → сохраняется как версия весов</span></h2>
-        <div class="card hint-card">
-            <b>Перед обучением:</b>
-            <ol>
-                <li>Запустите симулятор <b>без активных сценариев</b></li>
-                <li>Дайте поработать:
-                    при <b>1000×</b> — 2–3 минуты &nbsp;|&nbsp;
-                    при <b>100×</b> — 15–20 минут &nbsp;|&nbsp;
-                    при <b>1×</b> — 2–3 часа
-                </li>
-                <li>Нажмите «Обучить» — для каждой комбинации (тип станка + тип шестерни)
-                    нужно ≥ <b id="train-points-required">1000</b> точек</li>
-            </ol>
-        </div>
         <div class="card">
             <div class="row">
                 <div class="field">
@@ -94,14 +84,10 @@
 
     <!-- ── Скоринг и режим ──────────────────────────────── -->
     <section>
-        <h2>Скоринг и режим</h2>
+        <h2>Скоринг и режим
+            <button id="btn-reset" class="btn btn-tiny btn-red" style="margin-left:auto;">Сбросить результаты</button>
+        </h2>
         <div class="card">
-            <div class="controls-inline" style="margin-bottom:0.7rem;">
-                <button id="btn-detect" class="btn btn-blue">Детекция (run-once)</button>
-                <button id="btn-forecast" class="btn btn-blue">Детекция + прогноз</button>
-                <button id="btn-evaluate" class="btn btn-gray">Оценка качества</button>
-                <button id="btn-reset" class="btn btn-red">Сбросить результаты</button>
-            </div>
             <div class="controls-inline">
                 <label class="toggle"><input type="checkbox" id="bg-enabled"> Фоновый поток</label>
                 <span class="field" style="flex-direction:row; gap:0.4rem; align-items:center;">
@@ -117,10 +103,45 @@
                 <span class="muted" id="prophet-info" style="font-size:0.78rem;"></span>
             </div>
             <div id="run-result" hidden></div>
-            <div id="eval-result" hidden></div>
         </div>
     </section>
 </main>
+
+<!-- ── Модальное окно: инструкция ──────────────────────── -->
+<div id="help-overlay" class="modal-overlay" hidden>
+    <div class="modal">
+        <div class="modal-head">
+            <h3>Инструкция</h3>
+            <button id="btn-help-close" class="btn btn-tiny btn-gray" type="button">✕</button>
+        </div>
+        <div class="modal-body">
+            <h4>Что делает сервис</h4>
+            <p>Учится «норме» по чистым логам завода, затем в фоне ищет аномалии
+               (ECOD + IsolationForest) и строит предиктивные карточки (Prophet)
+               для дашбордов Grafana.</p>
+
+            <h4>Перед обучением</h4>
+            <ol>
+                <li>Запустите симулятор <b>без активных сценариев</b>.</li>
+                <li>Дайте поработать:
+                    при <b>1000×</b> — 2–3 минуты &nbsp;|&nbsp;
+                    при <b>100×</b> — 15–20 минут &nbsp;|&nbsp;
+                    при <b>1×</b> — 2–3 часа.
+                </li>
+                <li>Нажмите «Обучить и сохранить» — для каждой комбинации
+                    (тип станка + тип шестерни/фаза печи) нужно
+                    ≥ <b id="train-points-required">1000</b> точек.</li>
+            </ol>
+
+            <h4>Рабочий режим</h4>
+            <p>Включите галочки <b>«Фоновый поток»</b> (детекция) и
+               <b>«Prophet-прогноз»</b> (карточки Grafana) — оба контура идут
+               автоматически по своему интервалу. Ручные прогоны не нужны.
+               <b>«Сбросить результаты»</b> очищает витрину аномалий и прогнозов,
+               модели при этом не трогаются.</p>
+        </div>
+    </div>
+</div>
 
 <script src="/static/app.js"></script>
 </body>

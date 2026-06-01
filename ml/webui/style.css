@@ -17,6 +17,33 @@ header {
 }
 header h1 { margin: 0; font-size: 1.4rem; }
 header .sub { color: #888; font-size: 0.8rem; }
+.title-row { display: flex; align-items: center; gap: 0.7rem; }
+
+/* ── Модальное окно (инструкция) ─────────────────────── */
+.modal-overlay {
+    position: fixed; inset: 0; z-index: 100;
+    background: rgba(0, 0, 0, 0.6);
+    display: flex; align-items: center; justify-content: center;
+    padding: 1rem;
+}
+.modal-overlay[hidden] { display: none; }
+.modal {
+    background: #252525; border: 1px solid #444; border-radius: 8px;
+    width: 100%; max-width: 600px; max-height: 85vh; overflow: auto;
+    box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5);
+}
+.modal-head {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 0.8rem 1.2rem; border-bottom: 1px solid #444;
+    position: sticky; top: 0; background: #252525;
+}
+.modal-head h3 { margin: 0; font-size: 1.1rem; }
+.modal-body { padding: 1rem 1.2rem; font-size: 0.86rem; line-height: 1.5; color: #d0d0d0; }
+.modal-body h4 { margin: 1.1rem 0 0.3rem; color: #9ad; font-size: 0.92rem; }
+.modal-body h4:first-child { margin-top: 0; }
+.modal-body p { margin: 0.2rem 0; }
+.modal-body ol { margin: 0.3rem 0 0 1.2rem; padding: 0; }
+.modal-body li { margin-bottom: 0.3rem; }
 .status-line { display: flex; gap: 1rem; align-items: center; flex-wrap: wrap; }
 .badge {
     padding: 0.15rem 0.6rem; border-radius: 4px; font-size: 0.82rem;
@@ -78,11 +105,6 @@ tr:hover td { background: #262626; }
 .empty { color: #777; font-style: italic; padding: 0.6rem 0; }
 .toggle { font-size: 0.82rem; color: #ccc; cursor: pointer; user-select: none; }
 .toggle input { vertical-align: middle; margin-right: 0.3rem; }
-
-/* Карточка-инструкция перед обучением */
-.hint-card { background: #1e2820; border: 1px solid #3a5a3a; color: #c8e0c8; font-size: 0.83rem; margin-bottom: 0; }
-.hint-card ol { margin: 0.4rem 0 0 1.2rem; padding: 0; }
-.hint-card li { margin-bottom: 0.25rem; }
 
 /* Результат обучения */
 #train-result { white-space: normal; font-family: inherit; }

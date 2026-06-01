@@ -223,26 +223,6 @@ $("btn-train").onclick = () => withBtn($("btn-train"), async () => {
     await refreshModels(); await refreshStatus();
 });
 
-$("btn-detect").onclick = () => withBtn($("btn-detect"), async () => {
-    const res = await api("POST", "/detect", {});
-    $("run-result").hidden = false;
-    $("run-result").textContent = JSON.stringify(res, null, 2);
-    await refreshStatus();
-});
-
-$("btn-forecast").onclick = () => withBtn($("btn-forecast"), async () => {
-    const res = await api("POST", "/forecast", {});
-    $("run-result").hidden = false;
-    $("run-result").textContent = JSON.stringify(res, null, 2);
-    await refreshStatus();
-});
-
-$("btn-evaluate").onclick = () => withBtn($("btn-evaluate"), async () => {
-    const res = await api("POST", "/evaluate");
-    $("eval-result").hidden = false;
-    $("eval-result").textContent = JSON.stringify(res, null, 2);
-});
-
 armConfirm($("btn-reset"), "Сбросить результаты", async () => {
     const res = await api("POST", "/reset", {});
     $("run-result").hidden = false;
@@ -285,6 +265,15 @@ $("btn-prophet-now").onclick = () => withBtn($("btn-prophet-now"), async () => {
     $("run-result").hidden = false;
     $("run-result").textContent = JSON.stringify(res, null, 2);
     await refreshStatus();
+});
+
+// ── модальное окно «Инструкция» ──────────────────────────────
+function toggleHelp(show) { $("help-overlay").hidden = !show; }
+$("btn-help").onclick = () => toggleHelp(true);
+$("btn-help-close").onclick = () => toggleHelp(false);
+$("help-overlay").onclick = (e) => { if (e.target === $("help-overlay")) toggleHelp(false); };
+document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && !$("help-overlay").hidden) toggleHelp(false);
 });
 
 // ── init ──────────────────────────────────────────────────────

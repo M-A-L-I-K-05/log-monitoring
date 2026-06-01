@@ -272,7 +272,7 @@ class Pipeline:
                                    values="value", aggfunc="mean").sort_index()
         if mtype == "furnace":
             wide = features.filter_furnace_phase(wide, pcode)
-        wide = wide.resample(config.RESAMPLE_RULE).mean().ffill().dropna(how="all")
+        wide = features.to_continuous_minutes(wide, max_points=config.PROPHET_SERIES_POINTS)
         if wide.empty:
             return 0
 
@@ -303,36 +303,33 @@ class Pipeline:
         """
         if not forecaster.available():
             return {"prophet": "unavailable"}
-        with self._lock:
-            records = loki_client.fetch_events(
-                config.SENSOR_SERVICE, config.SENSOR_EVENT, lookback_min)
-            long_df = features.records_to_long(records)
-            frames = features.machine_frames(long_df)   # активные (mid, context)
+        # Fetch'и — ВНЕ лока (чтение Loki + чистая обработка), чтобы не держать общий
+        # лок и не тормозить детекцию. Активный контекст (текущая фаза печи / шестерня)
+        # берём по свежему малому окну; длинную ИСТОРИЮ под прогноз — ОДНИМ лёгким
+        # bulk-запросом (fetch_recent, без `| json`), режем по (станок, контекст) в
+        # Python. Так нет 12 тяжёлых per-station запросов, что и вешало фоновый поток.
+        active = set(features.machine_frames(features.records_to_long(
+            loki_client.fetch_events(
+                config.SENSOR_SERVICE, config.SENSOR_EVENT, lookback_min))).keys())
+        pframes = features.prophet_frames(
+            features.records_to_long(loki_client.fetch_recent(config.PROPHET_BULK_FETCH)),
+            config.PROPHET_SERIES_POINTS)
 
+        with self._lock:
             rows = []
             machines = anomalies = 0
             checked, no_norm = [], []
-            for (mid, ctx), (mtype, _wide) in frames.items():
+            for (mid, ctx) in active:
+                pf = pframes.get((mid, ctx))
+                if pf is None:                 # нет истории этого контекста в bulk
+                    continue
+                mtype, wide = pf
                 det = self.detectors.get(_det_key(mtype, ctx))
                 if det is None or not det.fitted:
                     no_norm.append(f"{mid}({mtype}/{ctx})")
                     continue
                 sensors = self._prophet_sensors(mtype, ctx, det)
                 if not sensors:
-                    continue
-
-                pc_filter = None if mtype == "furnace" else ctx
-                mrecords = loki_client.fetch_for_machine(
-                    mid, pc_filter, limit=config.PROPHET_FETCH_POINTS)
-                mlong = features.records_to_long(mrecords)
-                if mlong.empty:
-                    continue
-                wide = mlong.pivot_table(index="event_time", columns="sensor",
-                                         values="value", aggfunc="mean").sort_index()
-                if mtype == "furnace":
-                    wide = features.filter_furnace_phase(wide, ctx)
-                wide = wide.resample(config.RESAMPLE_RULE).mean().ffill().dropna(how="all")
-                if wide.empty:
                     continue
 
                 machines += 1
@@ -382,7 +379,10 @@ class Pipeline:
         if sensor not in wide.columns:
             return None
         ser = wide[sensor].dropna()
-        if len(ser) < config.MIN_TRAIN_POINTS:
+        # Отдельный, более высокий минимум для Prophet: на коротком ряду он
+        # экстраполирует шум за полосу (ложные карточки на старте фазы). См.
+        # config.PROPHET_MIN_POINTS.
+        if len(ser) < config.PROPHET_MIN_POINTS:
             return None
         fc = forecaster.forecast_series(ser, config.FORECAST_HORIZON_MIN)
         if fc is None:
