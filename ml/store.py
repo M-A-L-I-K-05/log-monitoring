@@ -104,19 +104,16 @@ def close() -> None:
 def ensure_tables() -> None:
     with _pool.connection() as conn:
         with conn.cursor() as cur:
-            # Сначала миграция: колонки должны существовать до CREATE INDEX
-            cur.execute("""
-                DO $$ BEGIN
-                    ALTER TABLE ml_anomalies ADD COLUMN machine_type TEXT;
-                EXCEPTION WHEN duplicate_column THEN NULL;
-                END $$;
-            """)
-            cur.execute("""
-                DO $$ BEGIN
-                    ALTER TABLE ml_anomalies ADD COLUMN product_code TEXT;
-                EXCEPTION WHEN duplicate_column THEN NULL;
-                END $$;
-            """)
+            # Миграция старых БД: колонки должны существовать до CREATE INDEX по ним.
+            # IF EXISTS — на свежей БД таблицы ещё нет, это безопасный no-op (иначе
+            # ALTER упал бы с undefined_table и завалил старт). IF NOT EXISTS — на
+            # уже мигрированной БД повторный запуск тоже no-op.
+            cur.execute(
+                "ALTER TABLE IF EXISTS ml_anomalies "
+                "ADD COLUMN IF NOT EXISTS machine_type TEXT")
+            cur.execute(
+                "ALTER TABLE IF EXISTS ml_anomalies "
+                "ADD COLUMN IF NOT EXISTS product_code TEXT")
             # Затем DDL (CREATE TABLE IF NOT EXISTS + индексы)
             cur.execute(DDL)
     logger.info("ml_tables_ready")
