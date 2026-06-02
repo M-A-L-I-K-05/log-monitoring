@@ -38,3 +38,6 @@ loki_data/
 
 # ML — веса детекторов (хранятся в named volume, не в репозитории)
 ml/models/
+
+# Конспекты
+Final qualifying work/
