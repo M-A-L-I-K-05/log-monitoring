@@ -8,7 +8,7 @@
 """
 import logging
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import numpy as np
 import pandas as pd
@@ -49,6 +49,10 @@ class Pipeline:
         # а не ограничивалось фиксированными ~10с. Дедуп по virtual event_time
         # ниже всё равно не даст записать одну точку дважды.
         self._last_fetch_end: datetime | None = None
+        # Предыдущее состояние прогнозной аномалии по (machine_id, sensor) — чтобы
+        # писать в ml_prophet_events только ФРОНТ нарастания (false→true), а не
+        # каждый цикл, пока аномалия держится.
+        self._prophet_prev: dict[tuple, bool] = {}
         self._lock = threading.Lock()
         self._load_active_on_start()
 
@@ -337,10 +341,21 @@ class Pipeline:
                     row = self._prophet_check_sensor(mid, mtype, ctx, det, wide, sensor)
                     if row is None:
                         continue
-                    rows.append(row)
+                    rows.append(row[:11])          # витрина-снимок (11 полей)
                     checked.append(f"{mid}/{sensor}")
-                    if row[4]:          # is_anomaly
+                    is_anom = row[4]
+                    if is_anom:
                         anomalies += 1
+                    # Лог-история: пишем только ФРОНТ нарастания (false→true), чтобы
+                    # один эпизод дал одну строку, а не по строке на каждый цикл.
+                    pkey = (mid, sensor)
+                    if is_anom and not self._prophet_prev.get(pkey, False):
+                        detected_at = row[11]      # виртуальное «сейчас» прогноза
+                        store.insert_prophet_event(
+                            mid, mtype, ctx, sensor, detected_at,
+                            lead_min=row[7], n_breaches=row[5], horizon_points=row[6],
+                            norm_lower=row[8], norm_upper=row[9], yhat_end=row[10])
+                    self._prophet_prev[pkey] = bool(is_anom)
 
             store.upsert_prophet_status(rows)
             # Чистим застрявшие строки (станок встал / сменил фазу печи), чтобы
@@ -412,102 +427,168 @@ class Pipeline:
         over = (future["yhat"] < lower) | (future["yhat"] > upper)
         n_breaches = int(over.sum())
         is_anom = n_breaches > 0
+        # now_v — виртуальное «сейчас» прогноза (последняя фактическая точка ряда);
+        # нужно и для lead, и как detected_at в логе ml_prophet_events.
+        now_v = fc.loc[fc["actual"].notna(), "ts"].max()
         lead_min = None
         if is_anom:
-            now_v = fc.loc[fc["actual"].notna(), "ts"].max()
             first_ts = future.loc[over, "ts"].min()
             lead_min = round((first_ts - now_v).total_seconds() / 60.0, 1)
         return (mid, mtype, ctx, sensor, is_anom, n_breaches, int(len(future)),
                 lead_min, round(lower, 4), round(upper, 4),
-                round(float(future["yhat"].iloc[-1]), 4))
+                round(float(future["yhat"].iloc[-1]), 4),
+                now_v.to_pydatetime() if hasattr(now_v, "to_pydatetime") else now_v)
 
     # ─── оценка качества ─────────────────────────────────────────
     def evaluate(self, real_lookback_min=None) -> dict:
+        """Количественная оценка по размеченным сценариям.
+
+        Источник правды — окна сценариев (ml_scenarios, синхронизируются из логов
+        scenario_event инкрементально от курсора). Срабатывания берём из УЖЕ
+        записанных таблиц, а не пересчётом из Loki: детектор — ml_anomalies,
+        Prophet — ml_prophet_events. Так оценка не упирается в потолок выгрузки Loki
+        и сводится к сравнению «окно сценария ↔ пойманные аномалии». Возвращает
+        раздельные секции detector/prophet + разбор по каждому сценарию (корреляция
+        по названию сценария).
+        """
         with self._lock:
-            records = loki_client.fetch_events(
-                config.SENSOR_SERVICE, config.SENSOR_EVENT, real_lookback_min)
-            long_df = features.records_to_long(records)
-            frames = features.machine_frames(long_df)
-            windows = self._scenario_windows(real_lookback_min)
+            # Привязка к ТЕКУЩЕМУ прогону: окно по виртуальному времени данных
+            # детекции/прогноза. Сценарии из прошлых прогонов (остались в Loki/БД,
+            # id переиспользуются) отсекаются — иначе ловим призраков и коллизии.
+            run_span = store.get_run_span()
+            if run_span[0] is None:
+                return {"version": self.active_version, "scenarios": 0,
+                        "note": "нет данных детекции — обучи модель и прогони сценарии"}
+            tol = timedelta(minutes=config.EVAL_TOLERANCE_MIN)
+            horizon = timedelta(minutes=config.FORECAST_HORIZON_MIN)
+            margin = tol + horizon
+            run_lo, run_hi = run_span[0] - margin, run_span[1] + margin
+            synced = self._sync_scenarios((run_lo, run_hi))
+            scenarios = store.get_scenarios(run_lo, run_hi)
+            if not scenarios:
+                return {"version": self.active_version, "scenarios": 0,
+                        "note": "в окне текущего прогона нет размеченных сценариев",
+                        "synced": synced}
 
-            tol = pd.Timedelta(minutes=config.EVAL_TOLERANCE_MIN)
-            tp = fp = fn_points = total_anom_points = total_norm_points = 0
-            detected_windows = 0
-            total_windows = sum(len(v) for v in windows.values())
-            lead_times = []
-            untrained = []
+            wins, span_from, span_to = [], None, None
+            for s in scenarios:
+                w0 = s["started_at"]
+                # Конец окна: событие завершения, если оно есть. Если сценарий открыт
+                # (в логах только start) — тянем окно до конца данных прогона. На станке
+                # в один момент активен только один сценарий, поэтому любое срабатывание
+                # на этой машине после старта относится именно к нему — в том числе
+                # предиктивное предупреждение Prophet ещё ДО того, как дрейф достиг
+                # порога (корректная ранняя поимка, а не ложное срабатывание).
+                w1 = s["ended_at"] or max(run_span[1], w0 + horizon)
+                if w1 < w0:
+                    w1 = w0
+                wins.append({"id": s["scenario_id"], "type": s["scenario_type"],
+                             "machine_id": s["machine_id"], "sensors": s["sensors"],
+                             "w0": w0, "w1": w1})
+                lo, hi = w0 - tol, w1 + tol
+                span_from = lo if span_from is None else min(span_from, lo)
+                span_to = hi if span_to is None else max(span_to, hi)
 
-            for (mid, pcode), (mtype, wide) in frames.items():
-                key = _det_key(mtype, pcode) if pcode else None
-                det = self.detectors.get(key) if key else None
-                if det is None or not det.fitted:
-                    untrained.append(f"{mid}({mtype}/{pcode})")
-                    continue
-                scored = det.score(wide)
-                if scored is None:
-                    continue
-                mwins = windows.get(mid, [])
+            det_anoms = store.get_detector_anomalies(span_from, span_to)
+            pr_events = store.get_prophet_events(span_from, span_to)
 
-                def in_window(ts):
-                    return any((w0 - tol) <= ts <= (w1 + tol) for w0, w1 in mwins)
+            def _inside_any(mid, ts):
+                return any(w["machine_id"] == mid
+                           and (w["w0"] - tol) <= ts <= (w["w1"] + tol) for w in wins)
 
-                first_det_in_win = {i: None for i in range(len(mwins))}
-                for ts, row in scored.iterrows():
-                    labeled = in_window(ts)
-                    pred = bool(row["is_anomaly"])
-                    if labeled:
-                        total_anom_points += 1
-                    else:
-                        total_norm_points += 1
-                    if pred and labeled:
-                        tp += 1
-                    elif pred and not labeled:
-                        fp += 1
-                    elif (not pred) and labeled:
-                        fn_points += 1
-                    if pred:
-                        for i, (w0, w1) in enumerate(mwins):
-                            if (w0 - tol) <= ts <= (w1 + tol) and first_det_in_win[i] is None:
-                                first_det_in_win[i] = ts
+            # ── корреляция по каждому сценарию ──
+            by_scenario = []
+            det_caught = pr_caught = 0
+            det_latencies, pr_leads, pr_latencies = [], [], []
+            for w in wins:
+                m, w0, w1 = w["machine_id"], w["w0"], w["w1"]
+                d_times = sorted(et for (mid, et, _s, _z) in det_anoms
+                                 if mid == m and (w0 - tol) <= et <= (w1 + tol))
+                d_ok = bool(d_times)
+                d_lat = round((d_times[0] - w0).total_seconds() / 60.0, 1) if d_ok else None
+                if d_ok:
+                    det_caught += 1
+                    det_latencies.append(d_lat)
 
-                for i, (w0, w1) in enumerate(mwins):
-                    if first_det_in_win[i] is not None:
-                        detected_windows += 1
-                        lead = (w1 - first_det_in_win[i]).total_seconds() / 60.0
-                        if lead > 0:
-                            lead_times.append(lead)
+                p_hits = sorted(((dt, lead) for (mid, _se, dt, lead, _b) in pr_events
+                                 if mid == m and (w0 - tol) <= dt <= (w1 + tol)),
+                                key=lambda x: x[0])
+                p_ok = bool(p_hits)
+                p_lead = p_hits[0][1] if p_ok else None
+                # Задержка Prophet — по аналогии с детектором: через сколько минут
+                # ПОСЛЕ начала сценария Prophet впервые предупредил (detected_at - w0).
+                # Дополняет упреждение (lead): lead меряет «через сколько прогноз
+                # пробьёт границу», задержка — «через сколько после старта среагировал».
+                p_lat = round((p_hits[0][0] - w0).total_seconds() / 60.0, 1) if p_ok else None
+                if p_ok:
+                    pr_caught += 1
+                    if p_lead is not None:
+                        pr_leads.append(p_lead)
+                    if p_lat is not None:
+                        pr_latencies.append(p_lat)
 
-            precision = tp / (tp + fp) if (tp + fp) else None
-            recall_pts = tp / (tp + fn_points) if (tp + fn_points) else None
-            f1 = (2 * precision * recall_pts / (precision + recall_pts)
-                  if precision and recall_pts else None)
-            window_recall = detected_windows / total_windows if total_windows else None
-            avg_lead = sum(lead_times) / len(lead_times) if lead_times else None
+                by_scenario.append({
+                    "scenario_id": w["id"], "scenario": w["type"],
+                    "machine_id": m, "sensors": w["sensors"],
+                    "window_start": w0.isoformat(), "window_end": w1.isoformat(),
+                    "detector": {"caught": d_ok, "detect_latency_min": d_lat},
+                    "prophet": {"caught": p_ok, "lead_min": p_lead,
+                                "detect_latency_min": p_lat},
+                })
+
+            total = len(wins)
+            det_tp = sum(1 for (mid, et, _s, _z) in det_anoms if _inside_any(mid, et))
+            det_fp = len(det_anoms) - det_tp
+            pr_tp = sum(1 for (mid, _se, dt, _l, _b) in pr_events if _inside_any(mid, dt))
+            pr_fp = len(pr_events) - pr_tp
 
             result = {
                 "version": self.active_version,
-                "untrained": untrained,
-                "labeled_windows": total_windows,
-                "detected_windows": detected_windows,
-                "window_recall": _round(window_recall),
-                "point_precision": _round(precision),
-                "point_recall": _round(recall_pts),
-                "point_f1": _round(f1),
-                "tp": tp, "fp": fp, "fn": fn_points,
-                "anomaly_points_labeled": total_anom_points,
-                "normal_points": total_norm_points,
-                "avg_lead_time_min": _round(avg_lead),
+                "scenarios": total,
                 "tolerance_min": config.EVAL_TOLERANCE_MIN,
+                "run_window": [run_span[0].isoformat(), run_span[1].isoformat()],
+                "synced_events": synced,
+                "detector": {
+                    "scenarios_detected": det_caught,
+                    "recall": _round(det_caught / total if total else None),
+                    "precision": _round(det_tp / (det_tp + det_fp) if (det_tp + det_fp) else None),
+                    "tp_points": det_tp, "fp_points": det_fp,
+                    "avg_detect_latency_min": _round(
+                        sum(det_latencies) / len(det_latencies) if det_latencies else None),
+                },
+                "prophet": {
+                    "scenarios_detected": pr_caught,
+                    "recall": _round(pr_caught / total if total else None),
+                    "precision": _round(pr_tp / (pr_tp + pr_fp) if (pr_tp + pr_fp) else None),
+                    "tp_events": pr_tp, "fp_events": pr_fp,
+                    "avg_lead_min": _round(
+                        sum(pr_leads) / len(pr_leads) if pr_leads else None),
+                    "avg_detect_latency_min": _round(
+                        sum(pr_latencies) / len(pr_latencies) if pr_latencies else None),
+                },
+                "by_scenario": by_scenario,
             }
-            logger.info("evaluate_done", extra={"details": result})
+            logger.info("evaluate_done", extra={"details": {
+                k: v for k, v in result.items() if k != "by_scenario"}})
             return result
 
-    def _scenario_windows(self, real_lookback_min=None) -> dict[str, list]:
-        recs = loki_client.fetch_events(
-            config.SCENARIO_SERVICE, config.SCENARIO_EVENT, real_lookback_min)
-        starts: dict[str, tuple[str, pd.Timestamp]] = {}
-        ends: dict[str, pd.Timestamp] = {}
-        for r in recs:
+    def _sync_scenarios(self, run_span) -> int:
+        """Читает логи scenario_event из Loki и пишет окна ТЕКУЩЕГО прогона в
+        ml_scenarios. Логи сценариев лёгкие (2 на сценарий), поэтому берём широкое
+        окно, но пишем только события, чьё ВИРТУАЛЬНОЕ время попадает в диапазон
+        текущих данных детекции (run_span). Так окна из прошлых прогонов, оставшиеся
+        в Loki, не попадают в оценку и не коллизят по scenario_id (id переиспользуются
+        каждый прогон). Возвращает число обработанных событий старт/стоп."""
+        span_lo, span_hi = run_span
+        if span_lo is None:
+            return 0
+        end = datetime.now(timezone.utc)
+        start = end - timedelta(days=config.LOKI_MAX_QUERY_DAYS)
+        logql = '{service_name="%s", event="%s"}' % (
+            config.SCENARIO_SERVICE, config.SCENARIO_EVENT)
+        records = loki_client.query_range(logql, start, end)
+        n = 0
+        for r in records:
             sid = r.get("entity_id")
             et = r.get("event_time")
             d = r.get("details") or {}
@@ -518,17 +599,24 @@ class Pipeline:
             ts = pd.to_datetime(et, errors="coerce")
             if pd.isna(ts):
                 continue
+            ts = ts.to_pydatetime()
+            if not (span_lo <= ts <= span_hi):   # сценарий из другого прогона
+                continue
             if ev == "start":
-                starts[sid] = (mid, ts)
+                sensors = (d.get("extra") or {}).get("sensors")
+                if isinstance(sensors, dict):
+                    sensors_s = ",".join(sensors.keys())      # {сенсор: величина} → имена
+                elif isinstance(sensors, list):
+                    sensors_s = ",".join(map(str, sensors))
+                else:
+                    sensors_s = str(sensors) if sensors else None
+                store.upsert_scenario_start(sid, d.get("scenario_type"), mid,
+                                            sensors_s, d.get("severity"), ts)
+                n += 1
             elif ev in ("auto_completed", "stopped"):
-                ends[sid] = ts
-        windows: dict[str, list] = {}
-        for sid, (mid, t0) in starts.items():
-            t1 = ends.get(sid, t0 + pd.Timedelta(minutes=config.FORECAST_HORIZON_MIN))
-            if t1 < t0:
-                t1 = t0
-            windows.setdefault(mid, []).append((t0, t1))
-        return windows
+                store.upsert_scenario_end(sid, ts)
+                n += 1
+        return n
 
     # ─── управление версиями ─────────────────────────────────────
     def activate_version(self, version: str) -> dict:
@@ -568,6 +656,8 @@ class Pipeline:
             self._last_seen.clear()   # иначе после очистки БД дедуп пропустит перескоринг
             self._persist_count.clear()
             self._last_fetch_end = None
+            self._prophet_prev.clear()  # сбросить фронт Prophet — иначе после reset
+            #                             пропустит первое предупреждение по сенсору
             return {"reset": True, "models_kept": True,
                     "active_version": self.active_version}
 

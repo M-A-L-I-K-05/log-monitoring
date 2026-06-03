@@ -114,5 +114,22 @@ tr:hover td { background: #262626; }
 .result-list { margin: 0.1rem 0 0.5rem 1.2rem; padding: 0; font-size: 0.8rem; color: #bbb; }
 .result-list code { background: #2a2a2a; padding: 0.1rem 0.3rem; border-radius: 3px; color: #9cd; }
 
+/* Оценка детекции по сценариям */
+.eval-cards { display: flex; gap: 0.8rem; flex-wrap: wrap; margin: 0.6rem 0; }
+.eval-card  { flex: 1; min-width: 230px; background: #222; border: 1px solid #333;
+              border-radius: 6px; padding: 0.6rem 0.8rem; font-size: 0.82rem; color: #bbb; }
+.eval-card .eval-h { font-weight: 600; color: #cfe; margin-bottom: 0.35rem; }
+.eval-card b { color: #ddd; }
+.ok-mark   { color: #7ec87e; font-weight: 700; }
+.miss-mark { color: #e07a6a; font-weight: 700; }
+
+/* Таблица оценки: 8 колонок. Длинный список сенсоров переносим (без этого он
+   растягивает таблицу и колонка упреждения уезжает за край), числовые колонки
+   узкие; .card даёт горизонтальный скролл на случай узкого экрана. */
+#evaluate-table { table-layout: auto; }
+#evaluate-table td.mono.muted { white-space: normal; word-break: break-word; max-width: 220px; }
+#evaluate-table th, #evaluate-table td { padding: 0.35rem 0.45rem; }
+.card:has(#evaluate-table) { overflow-x: auto; }
+
 /* «Взведённая» кнопка опасного действия (двойной клик для подтверждения) */
 .btn.armed { outline: 2px solid #f1c40f; outline-offset: 1px; font-weight: 700; }

@@ -174,9 +174,12 @@ def _clear_loki_async() -> None:
         loki.stop(timeout=15)
         # Стираем данные, пока Loki остановлен — через одноразовый контейнер,
         # которому отдаём те же тома (volumes_from), чтобы /loki был доступен.
+        # user="0" (root): иначе контейнер стартует под пользователем loki (uid
+        # 10001) и rm падает с Permission denied на файлах Loki → очистка молча не
+        # срабатывает (ошибка глоталась в except), а хранилище оставалось полным.
         dc.containers.run(
             image, entrypoint="sh", command=["-c", f"rm -rf {_LOKI_DATA_DIRS}"],
-            volumes_from=[loki.id], remove=True)
+            volumes_from=[loki.id], user="0", remove=True)
         loki.start()
         log.info("loki_cleaned")
     except Exception as exc:

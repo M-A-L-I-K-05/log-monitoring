@@ -124,19 +124,6 @@ def prophet_frames(long_df: pd.DataFrame, max_points: int = None) -> dict[tuple,
     return frames
 
 
-def _keep_context(mtype: str, pcode) -> bool:
-    """Проверяет, нужно ли обрабатывать комбинацию (machine_type, product_code/phase).
-
-    Для печи — только фазы из FURNACE_ML_PHASES.
-    Для остальных станков — product_code должен быть задан.
-    """
-    if mtype in config.SKIP_MACHINE_TYPES:
-        return False
-    if mtype == "furnace":
-        return pcode in config.FURNACE_ML_PHASES
-    return pcode is not None and not (isinstance(pcode, float) and pd.isna(pcode))
-
-
 def machine_frames(long_df: pd.DataFrame,
                    resample: str = None) -> dict[tuple, tuple]:
     """{(machine_id, context): (machine_type, wide_df)} — для скоринга.

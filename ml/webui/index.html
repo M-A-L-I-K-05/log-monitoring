@@ -105,6 +105,27 @@
             <div id="run-result" hidden></div>
         </div>
     </section>
+
+    <!-- ── Оценка детекции по сценариям ──────────────────── -->
+    <section>
+        <h2>Оценка детекции по сценариям
+            <button id="btn-evaluate" class="btn btn-tiny btn-blue" style="margin-left:auto;">Оценить</button>
+        </h2>
+        <p class="hint">Сравнивает окна запущенных сценариев (ground truth из логов) с пойманными аномалиями:
+            детектор — из ml_anomalies, Prophet — из ml_prophet_events. Запускать ПОСЛЕ прогона сценариев.</p>
+        <div class="card">
+            <div id="evaluate-summary" hidden></div>
+            <table id="evaluate-table" hidden>
+                <thead><tr>
+                    <th>Сценарий</th><th>Станок</th><th>Сенсоры</th>
+                    <th>Детектор</th><th>Задержка, мин</th>
+                    <th>Prophet</th><th>Задержка, мин</th><th>Упреждение, мин</th>
+                </tr></thead>
+                <tbody id="evaluate-tbody"></tbody>
+            </table>
+            <div id="evaluate-empty" class="empty" hidden>Нет размеченных сценариев — запусти сценарии и повтори.</div>
+        </div>
+    </section>
 </main>
 
 <!-- ── Модальное окно: инструкция ──────────────────────── -->

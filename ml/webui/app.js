@@ -200,6 +200,63 @@ function showTrainResult(res) {
     el.innerHTML = html;
 }
 
+// ── отображение результата оценки детекции ───────────────────
+function showEvaluateResult(res) {
+    const summary = $("evaluate-summary");
+    const table = $("evaluate-table");
+    const empty = $("evaluate-empty");
+    const tb = $("evaluate-tbody");
+
+    if (!res.scenarios) {                       // нет размеченных сценариев
+        summary.hidden = true; table.hidden = true;
+        empty.hidden = false;
+        empty.textContent = res.note || "Нет размеченных сценариев.";
+        return;
+    }
+    empty.hidden = true;
+
+    const d = res.detector || {}, p = res.prophet || {};
+    const pct = (x) => (x == null ? "—" : (x * 100).toFixed(1) + "%");
+    const v = (x) => (x == null ? "—" : x);
+
+    summary.hidden = false;
+    summary.innerHTML = `
+        <div class="result-ok">Сценариев: ${res.scenarios} · допуск ±${res.tolerance_min} мин</div>
+        <div class="eval-cards">
+          <div class="eval-card">
+            <div class="eval-h">Детектор</div>
+            <div>поймано: <b>${v(d.scenarios_detected)}/${res.scenarios}</b> (recall ${pct(d.recall)})</div>
+            <div>precision: <b>${pct(d.precision)}</b> <span class="muted">(TP ${v(d.tp_points)} / FP ${v(d.fp_points)})</span></div>
+            <div>ср. задержка: <b>${v(d.avg_detect_latency_min)}</b> мин</div>
+          </div>
+          <div class="eval-card">
+            <div class="eval-h">Prophet (упреждение)</div>
+            <div>поймано: <b>${v(p.scenarios_detected)}/${res.scenarios}</b> (recall ${pct(p.recall)})</div>
+            <div>precision: <b>${pct(p.precision)}</b> <span class="muted">(TP ${v(p.tp_events)} / FP ${v(p.fp_events)})</span></div>
+            <div>ср. задержка: <b>${v(p.avg_detect_latency_min)}</b> мин</div>
+            <div>ср. упреждение: <b>${v(p.avg_lead_min)}</b> мин</div>
+          </div>
+        </div>`;
+
+    const mark = (ok) => (ok ? '<span class="ok-mark">✓</span>' : '<span class="miss-mark">✗</span>');
+    tb.innerHTML = "";
+    for (const s of (res.by_scenario || [])) {
+        const dc = s.detector || {}, pc = s.prophet || {};
+        const tr = document.createElement("tr");
+        tr.innerHTML = `
+            <td class="mono">${s.scenario || "—"}</td>
+            <td class="mono">${s.machine_id || "—"}</td>
+            <td class="mono muted">${s.sensors || "—"}</td>
+            <td>${mark(dc.caught)}</td>
+            <td>${dc.detect_latency_min ?? "—"}</td>
+            <td>${mark(pc.caught)}</td>
+            <td>${pc.detect_latency_min ?? "—"}</td>
+            <td>${pc.lead_min ?? "—"}</td>`;
+        tb.appendChild(tr);
+    }
+    table.hidden = false;
+}
+
 // ── действия ──────────────────────────────────────────────────
 function num(el) {
     const v = el.value.trim();
@@ -265,6 +322,12 @@ $("btn-prophet-now").onclick = () => withBtn($("btn-prophet-now"), async () => {
     $("run-result").hidden = false;
     $("run-result").textContent = JSON.stringify(res, null, 2);
     await refreshStatus();
+});
+
+// «Оценить» — количественная оценка детекции/Prophet по запущенным сценариям.
+$("btn-evaluate").onclick = () => withBtn($("btn-evaluate"), async () => {
+    const res = await api("POST", "/evaluate", {});
+    showEvaluateResult(res);
 });
 
 // ── модальное окно «Инструкция» ──────────────────────────────

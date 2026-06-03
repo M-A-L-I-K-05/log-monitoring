@@ -259,8 +259,10 @@ def prophet_cycle():
 
 @app.post("/reset")
 def reset():
-    """Чистит результаты (ml_anomalies/forecasts/runs) и счётчик. Веса на диске
-    НЕ удаляются — для удаления модели используйте DELETE /models/{version}."""
+    """Чистит ВСЕ результаты ML: ml_runs, ml_anomalies, ml_forecasts,
+    ml_prophet_status, ml_prophet_events, ml_scenarios — и память пайплайна
+    (дедуп, фронт Prophet). Веса на диске НЕ удаляются — для удаления модели
+    используйте DELETE /models/{version}."""
     return pipeline.reset_results()
 
 

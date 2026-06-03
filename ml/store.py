@@ -85,6 +85,44 @@ CREATE TABLE IF NOT EXISTS ml_prophet_status (
 );
 CREATE INDEX IF NOT EXISTS ml_prophet_status_machine_idx ON ml_prophet_status (machine_id);
 CREATE INDEX IF NOT EXISTS ml_prophet_status_flag_idx    ON ml_prophet_status (is_anomaly);
+
+-- Лог-история предупреждений Prophet (append-only, в отличие от витрины-снимка
+-- ml_prophet_status). Строка пишется на ФРОНТЕ НАРАСТАНИЯ: когда (станок, сенсор)
+-- впервые в эпизоде даёт прогнозную аномалию. Не чистится TTL — нужна, чтобы после
+-- прогона восстановить, КОГДА и с каким упреждением Prophet поймал каждый сценарий.
+CREATE TABLE IF NOT EXISTS ml_prophet_events (
+    id                  BIGSERIAL   PRIMARY KEY,
+    machine_id          TEXT        NOT NULL,
+    machine_type        TEXT,
+    context             TEXT,                          -- тип шестерни или фаза печи
+    sensor              TEXT        NOT NULL,
+    detected_at         TIMESTAMP   NOT NULL,          -- виртуальное время выдачи прогноза
+    predicted_breach_at TIMESTAMP,                     -- detected_at + lead_min (виртуальное)
+    lead_min            REAL,                           -- упреждение: за сколько мин до выхода
+    n_breaches          INTEGER     NOT NULL DEFAULT 0,
+    horizon_points      INTEGER     NOT NULL DEFAULT 0,
+    norm_lower          REAL,
+    norm_upper          REAL,
+    yhat_end            REAL,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS ml_prophet_events_machine_idx ON ml_prophet_events (machine_id, sensor);
+CREATE INDEX IF NOT EXISTS ml_prophet_events_time_idx    ON ml_prophet_events (detected_at);
+
+-- Ground-truth окна сценариев, синхронизируются из логов scenario_event (Loki)
+-- инкрементально. Хранятся в БД, чтобы оценка не зависела от срока жизни логов и
+-- считалась сравнением «окно сценария ↔ таблицы пойманных аномалий».
+CREATE TABLE IF NOT EXISTS ml_scenarios (
+    scenario_id    TEXT        PRIMARY KEY,
+    scenario_type  TEXT,                               -- «название» сценария (для корреляции)
+    machine_id     TEXT        NOT NULL,
+    sensors        TEXT,                               -- затронутые сенсоры (через запятую)
+    severity       TEXT,
+    started_at     TIMESTAMP   NOT NULL,               -- виртуальное время старта
+    ended_at       TIMESTAMP,                          -- виртуальное время конца (NULL пока идёт)
+    updated_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS ml_scenarios_machine_idx ON ml_scenarios (machine_id, started_at);
 """
 
 
@@ -114,6 +152,9 @@ def ensure_tables() -> None:
             cur.execute(
                 "ALTER TABLE IF EXISTS ml_anomalies "
                 "ADD COLUMN IF NOT EXISTS product_code TEXT")
+            # Чистим рудимент: ml_eval_state был курсором инкрементального чтения
+            # Loki, сейчас не используется (sync читает широким окном + фильтр).
+            cur.execute("DROP TABLE IF EXISTS ml_eval_state")
             # Затем DDL (CREATE TABLE IF NOT EXISTS + индексы)
             cur.execute(DDL)
     logger.info("ml_tables_ready")
@@ -238,11 +279,118 @@ def prune_prophet_status(max_age_sec: float) -> int:
             return cur.rowcount
 
 
+def insert_prophet_event(machine_id: str, machine_type: str | None,
+                         context: str | None, sensor: str,
+                         detected_at: datetime, lead_min: float | None,
+                         n_breaches: int, horizon_points: int,
+                         norm_lower: float | None, norm_upper: float | None,
+                         yhat_end: float | None) -> None:
+    """Пишет одно предупреждение Prophet на фронте нарастания (append-only)."""
+    from datetime import timedelta
+    breach_at = None
+    if lead_min is not None and detected_at is not None:
+        breach_at = detected_at + timedelta(minutes=float(lead_min))
+    with _pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO ml_prophet_events (machine_id, machine_type, context, "
+                "sensor, detected_at, predicted_breach_at, lead_min, n_breaches, "
+                "horizon_points, norm_lower, norm_upper, yhat_end) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                (machine_id, machine_type, context, sensor, detected_at, breach_at,
+                 lead_min, n_breaches, horizon_points, norm_lower, norm_upper, yhat_end),
+            )
+
+
+def upsert_scenario_start(scenario_id: str, scenario_type: str | None,
+                          machine_id: str, sensors: str | None,
+                          severity: str | None, started_at: datetime) -> None:
+    with _pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO ml_scenarios (scenario_id, scenario_type, machine_id, "
+                "sensors, severity, started_at, updated_at) "
+                "VALUES (%s,%s,%s,%s,%s,%s, now()) "
+                "ON CONFLICT (scenario_id) DO UPDATE SET "
+                "scenario_type=EXCLUDED.scenario_type, machine_id=EXCLUDED.machine_id, "
+                "sensors=EXCLUDED.sensors, severity=EXCLUDED.severity, "
+                "started_at=EXCLUDED.started_at, updated_at=now()",
+                (scenario_id, scenario_type, machine_id, sensors, severity, started_at),
+            )
+
+
+def upsert_scenario_end(scenario_id: str, ended_at: datetime) -> None:
+    """Фиксирует конец сценария (старт уже должен быть записан)."""
+    with _pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE ml_scenarios SET ended_at=%s, updated_at=now() "
+                "WHERE scenario_id=%s AND (ended_at IS NULL OR ended_at < %s)",
+                (ended_at, scenario_id, ended_at),
+            )
+
+
+def get_scenarios(t_from: datetime | None = None,
+                  t_to: datetime | None = None) -> list[dict]:
+    sql = ("SELECT scenario_id, scenario_type, machine_id, sensors, severity, "
+           "started_at, ended_at FROM ml_scenarios")
+    params = ()
+    if t_from is not None and t_to is not None:
+        sql += " WHERE started_at BETWEEN %s AND %s"
+        params = (t_from, t_to)
+    sql += " ORDER BY started_at"
+    with _pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            cols = [c.name for c in cur.description]
+            return [dict(zip(cols, r)) for r in cur.fetchall()]
+
+
+def get_run_span() -> tuple[datetime | None, datetime | None]:
+    """Виртуальный диапазон ТЕКУЩИХ данных детекции/прогноза (ml_anomalies +
+    ml_prophet_events) — чтобы привязать оценку к текущему прогону и отсечь окна
+    сценариев из прошлых прогонов, оставшихся в Loki/БД."""
+    with _pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT min(event_time), max(event_time) FROM ml_anomalies")
+            a0, a1 = cur.fetchone()
+            cur.execute("SELECT min(detected_at), max(detected_at) FROM ml_prophet_events")
+            p0, p1 = cur.fetchone()
+    los = [x for x in (a0, p0) if x is not None]
+    his = [x for x in (a1, p1) if x is not None]
+    return (min(los) if los else None, max(his) if his else None)
+
+
+def get_detector_anomalies(t_from: datetime, t_to: datetime) -> list[tuple]:
+    """Аномальные точки детектора (is_anomaly) в окне виртуального времени."""
+    with _pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT machine_id, event_time, top_sensor, top_sensor_z "
+                "FROM ml_anomalies WHERE is_anomaly "
+                "AND event_time BETWEEN %s AND %s ORDER BY event_time",
+                (t_from, t_to))
+            return cur.fetchall()
+
+
+def get_prophet_events(t_from: datetime, t_to: datetime) -> list[tuple]:
+    with _pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT machine_id, sensor, detected_at, lead_min, predicted_breach_at "
+                "FROM ml_prophet_events WHERE detected_at BETWEEN %s AND %s "
+                "ORDER BY detected_at",
+                (t_from, t_to))
+            return cur.fetchall()
+
+
 def truncate_all() -> None:
     with _pool.connection() as conn:
         with conn.cursor() as cur:
             cur.execute("TRUNCATE ml_anomalies, ml_forecasts, ml_runs RESTART IDENTITY CASCADE")
             cur.execute("TRUNCATE ml_prophet_status")
+            cur.execute("TRUNCATE ml_prophet_events RESTART IDENTITY")
+            cur.execute("TRUNCATE ml_scenarios")
     logger.info("ml_tables_truncated")
 
 
