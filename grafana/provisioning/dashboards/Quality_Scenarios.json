@@ -166,8 +166,8 @@
     {
       "id": 11,
       "type": "piechart",
-      "title": "Причины брака — по параметрам",
-      "description": "Сколько брака даёт каждый измеряемый параметр (за всё время, по ВСЕМ параметрам сразу).",
+      "title": "Причины брака",
+      "description": "Сколько брака даёт каждая причина (название сценария или фоновый брак), за всё время.",
       "datasource": {"type": "grafana-postgresql-datasource", "uid": "PCC52D03280B7034C"},
       "gridPos": {"h": 9, "w": 12, "x": 0, "y": 5},
       "options": {
@@ -189,7 +189,7 @@
           "datasource": {"type": "grafana-postgresql-datasource", "uid": "PCC52D03280B7034C"},
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT parameter AS metric, count(*) AS value FROM measurements WHERE result='fail' AND parameter IS NOT NULL GROUP BY parameter ORDER BY value DESC"
+          "rawSql": "SELECT reason AS metric, count(*) AS value FROM measurements WHERE result='fail' AND reason IS NOT NULL GROUP BY reason ORDER BY value DESC"
         }
       ]
     },
