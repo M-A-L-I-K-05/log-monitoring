@@ -1,0 +1,613 @@
+ПРИЛОЖЕНИЯ
+
+Полный исходный код проекта размещён в репозитории GitHub по адресу:
+https://github.com/M-A-L-I-K-05/log-monitoring.git
+
+Ниже приведены ключевые фрагменты кода, поясняющие основные технические решения и упоминаемые в главе 3. Для краткости из листингов удалены комментарии и строки документации; полные версии файлов доступны в репозитории.
+
+
+ПРИЛОЖЕНИЕ А. Инфраструктура и развёртывание
+
+Состав приложения:
+- Листинг А.1 - фрагмент docker-compose.yml (определение бизнес-сервиса и ML-сервиса, метки сбора логов, тома);
+- Листинг А.2 - фрагмент схемы производственных таблиц (init.sql);
+- Листинг А.3 - конфигурация агента сбора логов Promtail.
+
+Листинг А.1 - Определение сервисов и томов в docker-compose.yml
+
+services:
+  equipment:
+    build: ./services/equipment
+    container_name: equipment
+    ports:
+      - "8001:8001"
+    environment:
+      PYTHONUNBUFFERED: 1
+      DATABASE_URL: postgresql://admin:secret@postgres:5432/factory
+    volumes:
+      - ./services/equipment:/app
+    command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8001", "--reload"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    labels:
+      logging: "promtail"
+    restart: unless-stopped
+
+  ml:
+    build: ./ml
+    container_name: ml
+    ports:
+      - "8006:8006"
+    environment:
+      PYTHONUNBUFFERED: 1
+      DATABASE_URL: postgresql://admin:secret@postgres:5432/factory
+      LOKI_URL: http://loki:3100
+      ML_MODELS_DIR: /app/models
+    volumes:
+      - ./ml:/app
+      - ml-models:/app/models
+    command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8006", "--reload"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      loki:
+        condition: service_started
+    labels:
+      logging: "promtail"
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  loki-data:
+  grafana-data:
+  ml-models:
+
+Листинг А.2 - Схема производственных таблиц (init.sql, фрагмент)
+
+CREATE TABLE machines (
+    machine_id    TEXT        PRIMARY KEY,
+    machine_type  TEXT        NOT NULL,
+    work_center   TEXT        NOT NULL,
+    model         TEXT        NOT NULL,
+    install_date  DATE        NOT NULL,
+    status        TEXT        NOT NULL DEFAULT 'active'
+);
+
+CREATE TABLE machine_status (
+    machine_id         TEXT        PRIMARY KEY REFERENCES machines(machine_id),
+    current_state      TEXT        NOT NULL,
+    state_changed_at   TIMESTAMP   NOT NULL,
+    sensor_updated_at  TIMESTAMP   NOT NULL
+);
+
+CREATE TABLE measurements (
+    measurement_id    BIGSERIAL   PRIMARY KEY,
+    batch_id          TEXT        NOT NULL,
+    part_index        INTEGER     NOT NULL,
+    product_code      TEXT        NOT NULL,
+    stage             TEXT        NOT NULL,
+    machine_id        TEXT        NOT NULL,
+    parameter         TEXT        NOT NULL,
+    value             REAL        NOT NULL,
+    nominal           REAL        NOT NULL,
+    tolerance         REAL        NOT NULL,
+    unit              TEXT        NOT NULL,
+    result            TEXT        NOT NULL,
+    reason            TEXT,
+    source_machine_id TEXT,
+    scenario_id       TEXT,
+    measured_at       TIMESTAMP   NOT NULL
+);
+CREATE INDEX measurements_result_idx   ON measurements (result);
+CREATE INDEX measurements_scenario_idx ON measurements (scenario_id);
+
+Листинг А.3 - Конфигурация агента Promtail (promtail-config.yaml)
+
+server:
+  http_listen_port: 9080
+  grpc_listen_port: 0
+
+positions:
+  filename: /tmp/positions.yaml
+
+clients:
+  - url: http://loki:3100/loki/api/v1/push
+
+scrape_configs:
+  - job_name: docker
+    docker_sd_configs:
+      - host: unix:///var/run/docker.sock
+        refresh_interval: 5s
+        filters:
+          - name: label
+            values: ["logging=promtail"]
+    relabel_configs:
+      - source_labels: [__meta_docker_container_label_com_docker_compose_service]
+        target_label: service_name
+    pipeline_stages:
+      - json:
+          expressions:
+            level: level
+            event: event
+      - labels:
+          level: ""
+          event: ""
+
+
+ПРИЛОЖЕНИЕ Б. Бизнес-сервисы предметной области
+
+Состав приложения:
+- Листинг Б.1 - настройка структурного JSON-логирования (общая для всех сервисов);
+- Листинг Б.2 - обработчик приёма сенсорного показания и его запись в лог (сервис Equipment);
+- Листинг Б.3 - запись результата контроля качества в лог (сервис Quality).
+
+Листинг Б.1 - Настройка структурного JSON-логирования
+
+def setup_logging(service_name: str) -> logging.Logger:
+    formatter = jsonlogger.JsonFormatter(
+        "%(levelname)s %(name)s %(message)s",
+        rename_fields={
+            "levelname": "level",
+            "name": "service",
+            "message": "event",
+        },
+    )
+    handler = logging.StreamHandler()
+    handler.setFormatter(formatter)
+    root = logging.getLogger()
+    root.handlers.clear()
+    root.addHandler(handler)
+    root.setLevel(logging.INFO)
+    for name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+        uv_logger = logging.getLogger(name)
+        uv_logger.handlers.clear()
+        uv_logger.propagate = False
+        uv_logger.disabled = True
+    return logging.getLogger(service_name)
+
+Листинг Б.2 - Обработчик сенсорного показания (сервис Equipment)
+
+@app.post("/sensor-reading")
+def sensor_reading(data: SensorReading):
+    logger.info(
+        "sensor_reading",
+        extra={
+            "entity_id": data.machine_id,
+            "event_time": data.event_time.isoformat(),
+            "details": {
+                "machine_type": data.machine_type,
+                "work_center": data.work_center,
+                "product_code": data.product_code,
+                "readings": data.readings,
+            },
+        },
+    )
+    persisted = db_update_sensor_timestamp(data.machine_id, data.event_time)
+    return {"accepted": True, "machine_id": data.machine_id, "db_persisted": persisted}
+
+Листинг Б.3 - Запись результата контроля качества (сервис Quality)
+
+def _log_measurement(data: Measurement) -> None:
+    logger.info(
+        "measurement",
+        extra={
+            "entity_id": data.part_id,
+            "event_time": data.event_time.isoformat(),
+            "details": {
+                "batch_id": data.batch_id,
+                "part_index": data.part_index,
+                "product_code": data.product_code,
+                "stage": data.stage,
+                "machine_id": data.machine_id,
+                "work_center": data.work_center,
+                "parameter": data.parameter,
+                "value": data.value,
+                "nominal": data.nominal,
+                "tolerance": data.tolerance,
+                "unit": data.unit,
+                "result": data.result,
+                "reason": data.reason,
+                "source_machine_id": data.source_machine_id,
+                "scenario_id": data.scenario_id,
+            },
+        },
+    )
+
+
+ПРИЛОЖЕНИЕ В. Симулятор производственного участка
+
+Состав приложения:
+- Листинг В.1 - тело главного цикла моделирования;
+- Листинг В.2 - генерация сенсорных показаний в штатном режиме;
+- Листинг В.3 - применение постепенного сценария (дрейф параметра);
+- Листинг В.4 - переход между фазами цикла печи;
+- Листинг В.5 - ключевые структуры конфигурации (фазы печи, профили сенсоров, образец сценария).
+
+Листинг В.1 - Тело главного цикла моделирования (loop.py)
+
+def _run(self) -> None:
+    client = self._find_client()
+    while not self._stop_event.is_set():
+        if self.state.ff_pending() > 0:
+            self._drain_fast_forward(client)
+            continue
+        tick_started = time.perf_counter()
+        self.state.advance_time(config.TICK_REAL_SEC)
+        if self.state.running:
+            now = self.state.virtual_time
+            for sub in self.subsystems:
+                sub.tick(now)
+            if client is not None:
+                client.flush()
+        elapsed = time.perf_counter() - tick_started
+        sleep_left = config.TICK_REAL_SEC - elapsed
+        if sleep_left > 0:
+            time.sleep(sleep_left)
+
+Листинг В.2 - Генерация сенсорных показаний в штатном режиме
+
+def _generate_sensor_readings(self, machine, product_code):
+    profile = config.SENSOR_PROFILES.get(machine.machine_type, {})
+    product_mods = config.SENSOR_MODIFIERS_BY_PRODUCT.get(product_code, {}) if product_code else {}
+    result = {}
+    for name, (mean, std, _unit) in profile.items():
+        value = config.bounded_gauss(mean, std)
+        product_mult = product_mods.get(name)
+        if product_mult is not None:
+            value *= product_mult
+        anomaly_mult = machine.anomaly_modifier.get(name)
+        if anomaly_mult is not None:
+            value *= anomaly_mult
+        result[name] = round(value, 4)
+    return result
+
+Листинг В.3 - Применение постепенного сценария (накопление дрейфа)
+
+if machine.active_scenario_id:
+    meta = self.state.scenarios_registry.get(machine.active_scenario_id)
+    if meta and meta.get("mode") == "gradual":
+        pace = meta.get("pace") or 0.0
+        machine.drift_progress = min(1.0, machine.drift_progress + pace)
+        for sensor, target in meta.get("sensors_final", {}).items():
+            machine.anomaly_modifier[sensor] = (
+                1.0 + (target - 1.0) * machine.drift_progress
+            )
+
+Листинг В.4 - Переход между фазами цикла печи (фрагмент)
+
+def _advance_phase(self, machine, load, now):
+    duration_sec = config.FURNACE_PHASE_DURATIONS_SEC[load.phase]
+    elapsed = (now - load.phase_started_at).total_seconds()
+    if elapsed < duration_sec:
+        return
+    old_phase = load.phase
+    next_phase = config.FURNACE_NEXT_PHASE[old_phase]
+    load.phase = next_phase
+    load.phase_started_at = now
+
+Листинг В.5 - Ключевые структуры конфигурации симулятора
+
+FURNACE_PHASE_DURATIONS_SEC = {
+    "loading":     5  * 60,
+    "heating":     120 * 60,
+    "carburizing": 240 * 60,
+    "quenching":   30 * 60,
+    "tempering":   90 * 60,
+    "unloading":   5  * 60,
+}
+
+FURNACE_NEXT_PHASE = {
+    "loading":     "heating",
+    "heating":     "carburizing",
+    "carburizing": "quenching",
+    "quenching":   "tempering",
+    "tempering":   "unloading",
+    "unloading":   "empty",
+}
+
+FURNACE_SENSOR_PROFILES = {
+    "carburizing": {
+        "furnace_temp_zone1":  (927.0, 4.0, "C"),
+        "furnace_temp_zone2":  (927.0, 4.0, "C"),
+        "furnace_temp_zone3":  (927.0, 4.0, "C"),
+        "atmosphere_pressure": (1.015, 0.003, "atm"),
+        "carbon_potential":    (1.10, 0.05, "%C"),
+    },
+}
+
+SCENARIOS = {
+    "turning": {
+        "tool_wear": {
+            "mode": "gradual",
+            "sensors": {
+                "vibration_rms_mm_s":   1.66,
+                "spindle_load_percent": 1.39,
+                "spindle_bearing_temp": 1.24,
+            },
+            "measurements": {"blank_runout": "up"},
+            "wo_duration_min": 25,
+        },
+    },
+}
+
+
+ПРИЛОЖЕНИЕ Г. ML-сервис
+
+Состав приложения:
+- Листинг Г.1 - подготовка признаков (приведение к широкому формату и ресемплинг);
+- Листинг Г.2 - обучение детектора и калибровка порога;
+- Листинг Г.3 - скоринг и комбинированное решающее правило;
+- Листинг Г.4 - правило персистентности;
+- Листинг Г.5 - предиктивный контур (прогноз Prophet и проверка выхода за норму);
+- Листинг Г.6 - постраничный запрос к Loki;
+- Листинг Г.7 - схема таблиц результатов анализа.
+
+Листинг Г.1 - Подготовка признаков (features.py)
+
+def machine_frames(long_df, resample=None):
+    resample = resample or config.RESAMPLE_RULE
+    frames = {}
+    if long_df.empty:
+        return frames
+    for mid, g in long_df.groupby("machine_id"):
+        mtype = g["machine_type"].iloc[0]
+        if mtype in config.SKIP_MACHINE_TYPES:
+            continue
+        if mtype == "furnace":
+            raw = g.pivot_table(index="event_time", columns="sensor",
+                                values="value", aggfunc="mean").sort_index()
+            for phase in config.FURNACE_ML_PHASES:
+                pw = filter_furnace_phase(raw, phase)
+                if pw.empty:
+                    continue
+                pw = pw.resample(resample).mean().dropna(axis=1, how="all")
+                pw = pw.ffill().dropna(how="all")
+                if not pw.empty:
+                    frames[(mid, phase)] = (mtype, pw)
+        else:
+            for pcode, pg in g.groupby("product_code", dropna=True):
+                if pd.isna(pcode) or pcode is None:
+                    continue
+                wide = pg.pivot_table(index="event_time", columns="sensor",
+                                      values="value", aggfunc="mean").sort_index()
+                wide = wide.resample(resample).mean().ffill().dropna(how="all")
+                if wide.empty:
+                    continue
+                frames[(mid, pcode)] = (mtype, wide)
+    return frames
+
+Листинг Г.2 - Обучение детектора и калибровка порога (detectors.py)
+
+def fit(self, wide, machine_type=None):
+    X = wide.dropna()
+    self.columns = list(wide.columns)
+    if len(X) < config.MIN_TRAIN_POINTS or X.shape[1] == 0:
+        return False
+    if machine_type:
+        self.machine_type = machine_type
+    self.ecod = ECOD(contamination=self.contamination)
+    self.ecod.fit(X.values)
+    self.iforest = IForest(contamination=self.contamination,
+                           random_state=config.IFOREST_RANDOM_STATE)
+    self.iforest.fit(X.values)
+    if config.THRESHOLD_SIGMA > 0:
+        s = self.ecod.decision_scores_
+        self.ecod.threshold_ = s.mean() + config.THRESHOLD_SIGMA * s.std()
+        s = self.iforest.decision_scores_
+        self.iforest.threshold_ = s.mean() + config.THRESHOLD_SIGMA * s.std()
+    self.train_mean = X.mean()
+    self.train_std = X.std(ddof=0).replace(0, np.nan)
+    _bin = pd.Timedelta(config.RESAMPLE_RULE).total_seconds()
+    _n = max(1.0, _bin / config.SENSOR_INTERVAL_SEC)
+    self.train_std_resampled = self.train_std / np.sqrt(_n)
+    self.n_train = len(X)
+    return True
+
+Листинг Г.3 - Скоринг и комбинированное решающее правило (detectors.py)
+
+def score(self, wide):
+    if not self.fitted:
+        return None
+    X = wide.reindex(columns=self.columns).ffill().dropna()
+    if X.empty:
+        return None
+    res = pd.DataFrame(index=X.index)
+    res["label_ecod"]    = self.ecod.predict(X.values).astype(int)
+    res["label_iforest"] = self.iforest.predict(X.values).astype(int)
+    z = (X - self.train_mean) / self.train_std
+    z = z.abs().replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    res["top_sensor"]   = z.idxmax(axis=1)
+    res["top_sensor_z"] = z.max(axis=1).round(3)
+    if config.ANOMALY_Z > 0:
+        z_flag = res["top_sensor_z"] >= config.ANOMALY_Z
+    else:
+        z_flag = pd.Series(False, index=res.index)
+    if config.ANOMALY_COMBINE == "both":
+        det_flag = (res["label_ecod"] == 1) & (res["label_iforest"] == 1)
+    else:
+        det_flag = (res["label_ecod"] == 1) | (res["label_iforest"] == 1)
+    res["is_anomaly"] = z_flag | det_flag
+    return res
+
+Листинг Г.4 - Правило персистентности (pipeline.py)
+
+def _apply_persistence(self, key, scored):
+    n = config.PERSIST_N
+    if n <= 1:
+        return scored
+    counts = self._persist_count.get(key, {})
+    flags = []
+    for hot in scored["hot"].tolist():
+        counts = {ch: counts.get(ch, 0) + 1 for ch in hot}
+        flags.append(any(c >= n for c in counts.values()))
+    self._persist_count[key] = counts
+    scored["is_anomaly"] = flags
+    return scored
+
+Листинг Г.5 - Предиктивный контур: прогноз и проверка выхода за норму (pipeline.py)
+
+def _prophet_check_sensor(self, mid, mtype, ctx, det, wide, sensor):
+    ser = wide[sensor].dropna()
+    if len(ser) < config.PROPHET_MIN_POINTS:
+        return None
+    fc = forecaster.forecast_series(ser, config.FORECAST_HORIZON_MIN)
+    if fc is None:
+        return None
+    mean = float(det.train_mean[sensor])
+    std = float(det.train_std[sensor])
+    band_std = self._prophet_band_std(det, sensor, std)
+    lower = mean - config.ANOMALY_Z * band_std
+    upper = mean + config.ANOMALY_Z * band_std
+    future = fc[fc["actual"].isna()]
+    over = (future["yhat"] < lower) | (future["yhat"] > upper)
+    n_breaches = int(over.sum())
+    is_anom = n_breaches > 0
+    now_v = fc.loc[fc["actual"].notna(), "ts"].max()
+    lead_min = None
+    if is_anom:
+        first_ts = future.loc[over, "ts"].min()
+        lead_min = round((first_ts - now_v).total_seconds() / 60.0, 1)
+    return (mid, mtype, ctx, sensor, is_anom, n_breaches, int(len(future)),
+            lead_min, round(lower, 4), round(upper, 4),
+            round(float(future["yhat"].iloc[-1]), 4), now_v)
+
+Листинг Г.6 - Постраничный запрос к Loki (loki_client.py)
+
+def query_range(logql, start, end, limit=None, max_lines=None):
+    limit = limit or config.LOKI_PAGE_LIMIT
+    max_lines = max_lines or config.MAX_LOG_LINES
+    url = f"{config.LOKI_URL}/loki/api/v1/query_range"
+    collected = []
+    cur_end = end
+    while True:
+        params = {"query": logql, "start": _ns(start), "end": _ns(cur_end),
+                  "limit": limit, "direction": "backward"}
+        r = requests.get(url, params=params, timeout=config.LOKI_TIMEOUT_SEC)
+        r.raise_for_status()
+        result = r.json().get("data", {}).get("result", [])
+        page = []
+        for stream in result:
+            for ns, line in stream.get("values", []):
+                page.append((int(ns), line))
+        if not page:
+            break
+        page.sort(key=lambda x: x[0], reverse=True)
+        collected.extend(page)
+        if len(collected) >= max_lines:
+            collected = collected[:max_lines]
+            break
+        oldest_ns = page[-1][0]
+        new_end = datetime.fromtimestamp(oldest_ns / 1e9, tz=timezone.utc) - timedelta(microseconds=1)
+        if len(page) < limit or new_end <= start:
+            break
+        cur_end = new_end
+    records = []
+    for _ns_ts, line in collected:
+        try:
+            records.append(json.loads(line))
+        except (json.JSONDecodeError, TypeError):
+            continue
+    return records
+
+Листинг Г.7 - Схема таблиц результатов анализа (store.py, фрагмент)
+
+CREATE TABLE IF NOT EXISTS ml_anomalies (
+    id            BIGSERIAL   PRIMARY KEY,
+    run_id        BIGINT      REFERENCES ml_runs(run_id) ON DELETE CASCADE,
+    machine_id    TEXT        NOT NULL,
+    machine_type  TEXT,
+    product_code  TEXT,
+    event_time    TIMESTAMP   NOT NULL,
+    score_ecod    REAL,
+    score_iforest REAL,
+    is_anomaly    BOOLEAN     NOT NULL,
+    top_sensor    TEXT,
+    top_sensor_z  REAL,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS ml_prophet_events (
+    id                  BIGSERIAL   PRIMARY KEY,
+    machine_id          TEXT        NOT NULL,
+    machine_type        TEXT,
+    context             TEXT,
+    sensor              TEXT        NOT NULL,
+    detected_at         TIMESTAMP   NOT NULL,
+    predicted_breach_at TIMESTAMP,
+    lead_min            REAL,
+    n_breaches          INTEGER     NOT NULL DEFAULT 0,
+    horizon_points      INTEGER     NOT NULL DEFAULT 0,
+    norm_lower          REAL,
+    norm_upper          REAL,
+    yhat_end            REAL,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+
+ПРИЛОЖЕНИЕ Д. Ключевые параметры конфигурации
+
+Состав приложения:
+- Листинг Д.1 - параметры аналитического ядра (пороги детекции и прогнозирования);
+- Листинг Д.2 - главные сенсоры для предиктивного контура;
+- Листинг Д.3 - профили сенсоров оборудования (фрагмент).
+
+Эти параметры образуют предметно-зависимую часть системы: их изменение адаптирует решение к другому процессу без переработки аналитического ядра (раздел 3.8).
+
+Листинг Д.1 - Параметры аналитического ядра (ml/config.py)
+
+CONTAMINATION = 0.02
+THRESHOLD_SIGMA = 3.0
+ANOMALY_Z = 2.8
+ANOMALY_COMBINE = "any"
+PERSIST_N = 3
+RESAMPLE_RULE = "1min"
+MIN_TRAIN_POINTS = 30
+TRAIN_POINTS = 1000
+FORECAST_HORIZON_MIN = 30
+PROPHET_INTERVAL_WIDTH = 0.99
+PROPHET_SERIES_POINTS = 200
+PROPHET_MIN_POINTS = 60
+
+Листинг Д.2 - Главные сенсоры для предиктивного контура (ml/config.py)
+
+MAIN_SENSORS = {
+    "turning":              ["vibration_rms_mm_s", "spindle_load_percent", "spindle_bearing_temp"],
+    "hobbing":              ["vibration_rms_mm_s", "spindle_load_percent", "hob_bearing_temp"],
+    "shaving":              ["vibration_rms_mm_s", "spindle_load_percent"],
+    "grinding":             ["vibration_rms_mm_s", "wheel_bearing_temp", "coolant_flow", "spindle_power_kw"],
+    "furnace__carburizing": ["carbon_potential", "furnace_temp_zone1"],
+    "furnace__quenching":   ["quench_oil_temp", "quench_oil_flow", "furnace_temp_zone1"],
+}
+
+Листинг Д.3 - Профили сенсоров оборудования (simulator/config.py, фрагмент)
+
+SENSOR_PROFILES = {
+    "turning": {
+        "spindle_load_percent": (45.0, 5.0,  "%"),
+        "spindle_rpm":          (1800.0, 50.0, "rpm"),
+        "feed_rate_mm_min":     (220.0, 10.0, "mm/min"),
+        "coolant_temp_c":       (28.0, 1.5,  "C"),
+        "vibration_rms_mm_s":   (0.8, 0.15,  "mm/s"),
+        "spindle_bearing_temp": (45.0, 3.0, "C"),
+    },
+    "hobbing": {
+        "hob_spindle_rpm":      (600.0, 30.0, "rpm"),
+        "work_spindle_rpm":     (40.0, 5.0,  "rpm"),
+        "axial_feed_rate":      (1.5, 0.2,   "mm/rev"),
+        "spindle_load_percent": (62.0, 6.0,  "%"),
+        "vibration_rms_mm_s":   (1.4, 0.25,  "mm/s"),
+        "hob_bearing_temp":     (55.0, 4.0, "C"),
+        "cutting_oil_temp":     (32.0, 2.0, "C"),
+        "cutting_oil_flow":     (100.0, 5.0, "L/min"),
+    },
+    "grinding": {
+        "wheel_spindle_rpm":    (4500.0, 100.0, "rpm"),
+        "work_spindle_rpm":     (120.0, 15.0, "rpm"),
+        "spindle_power_kw":     (10.0, 2.0, "kW"),
+        "vibration_rms_mm_s":   (0.6, 0.15, "mm/s"),
+        "wheel_bearing_temp":   (47.0, 3.0, "C"),
+        "coolant_flow":         (100.0, 5.0, "L/min"),
+        "coolant_temp_c":       (21.0, 1.5, "C"),
+    },
+}

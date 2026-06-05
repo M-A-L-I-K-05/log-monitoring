@@ -1,0 +1,83 @@
+@startuml
+' Компонентная диаграмма системы мониторинга логов производства.
+' Направление сплошных стрелок = КТО К КОМУ ОБРАЩАЕТСЯ (инициатор вызова -> адресат),
+' а не поток данных. Подпись на стрелке = протокол/тип вызова.
+' Пунктирные стрелки = сбор stdout агентом Promtail (зависимость, не вызов сервиса).
+
+title Компонентная архитектура системы мониторинга логов производства
+
+skinparam shadowing false
+skinparam componentStyle rectangle
+skinparam defaultTextAlignment center
+skinparam component {
+  BackgroundColor<<service>> #DAE8FC
+  BackgroundColor<<ml>> #D5E8D4
+  BackgroundColor<<infra>> #F8CECC
+  BackgroundColor<<ui>> #E1D5E7
+}
+skinparam database {
+  BackgroundColor<<storage>> #FFF2CC
+}
+
+' ── Интерфейсы пользователя ────────────────────────────────
+component "WebUI симулятора\n(управление прогоном, :8005)" <<ui>> as SimUI
+component "WebUI ML-сервиса\n(обучение, прогоны, :8006)" <<ui>> as MlUI
+component "Grafana\n(дашборды инженера, :3000)" <<ui>> as Grafana
+
+' ── Симулятор-источник ─────────────────────────────────────
+component "Симулятор производства\n(виртуальные часы, :8005)" <<service>> as Sim
+
+' ── Бизнес-сервисы предметной области ──────────────────────
+package "Производственные микросервисы" {
+  component "Equipment Service\n(:8001)" <<service>> as EQ
+  component "Production Service\n(:8002)" <<service>> as PR
+  component "Quality Service\n(:8003)" <<service>> as QA
+  component "Maintenance Service\n(:8004)" <<service>> as MT
+}
+
+' ── ML-сервис ──────────────────────────────────────────────
+component "ML-сервис\n(ECOD + IsolationForest + Prophet, :8006)" <<ml>> as ML
+
+' ── Инфраструктура ─────────────────────────────────────────
+package "Стек логирования" {
+  component "Promtail\n(сбор логов)" <<infra>> as Promtail
+  database "Loki\n(хранилище логов, :3100)" <<storage>> as Loki
+}
+database "PostgreSQL\n(:5432)" <<storage>> as PG
+
+' ===== ВЫЗОВЫ: инициатор -> адресат =====
+
+' Оператор управляет симулятором и ML через их отдельные веб-интерфейсы
+SimUI --> Sim : REST
+MlUI  --> ML  : REST
+
+' Симулятор подаёт события во все бизнес-сервисы
+Sim --> EQ : REST
+Sim --> PR : REST
+Sim --> QA : REST
+Sim --> MT : REST
+
+' Бизнес-сервисы пишут/читают свою БД
+EQ --> PG : SQL
+PR --> PG : SQL
+QA --> PG : SQL
+MT --> PG : SQL
+
+' ML читает логи из Loki и пишет результаты в PostgreSQL
+ML --> Loki : LogQL (чтение)
+ML --> PG   : SQL (запись результатов)
+
+' Promtail отправляет собранные логи в Loki
+Promtail --> Loki : HTTP push
+
+' Grafana обращается к обоим источникам данных
+Grafana --> Loki : LogQL
+Grafana --> PG   : SQL
+
+' ===== Сбор stdout (пунктир — не вызов, а сбор логов агентом) =====
+EQ ..> Promtail : stdout
+PR ..> Promtail : stdout
+QA ..> Promtail : stdout
+MT ..> Promtail : stdout
+
+@enduml
